@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "payment-integration": {
+      "source": "rmyndharis/antigravity-skills",
+      "sourceType": "github",
+      "skillPath": "skills/payment-integration/SKILL.md",
+      "computedHash": "988781a6d42541b6d3648d0dcbf061f16374eb571677b5ba43654e9153d0520f"
+    }
+  }
+}
