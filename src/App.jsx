@@ -381,8 +381,8 @@ const PaymentPage = ({ settings, setUsers }) => {
   const [selectedMonths, setSelectedMonths] = useState(1);
 
   const TIERS = {
-    pro:        { label: 'Pro',        pricePerMonth: 370000 },
-    enterprise: { label: 'Enterprise', pricePerMonth: 1260000 },
+    plus:       { label: 'Plus',       pricePerMonth: 199000 },
+    pro:        { label: 'Pro',        pricePerMonth: 400000 },
   };
 
   const PERIODS = [
