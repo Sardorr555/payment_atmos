@@ -5,6 +5,18 @@ const formatUZS = (amount) => {
   return new Intl.NumberFormat('uz-UZ', { style: 'currency', currency: 'UZS', maximumFractionDigits: 0 }).format(amount);
 };
 
+// Fallback UUID generator for non-secure contexts (HTTP) where crypto.randomUUID is not available
+const generateUUID = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+};
+
 // API keys are stored on the backend server — never in the frontend!
 // All payment calls go through our secure Express proxy at /api/*
 
@@ -21,9 +33,17 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
   const [transactionId, setTransactionId] = useState(null);
   const [cvc, setCvc] = useState('');
   const [cardName, setCardName] = useState('');
+  const [maskedPhone, setMaskedPhone] = useState('');
 
   const cleanCardNumber = cardNumber.replace(/\s/g, '');
-  const isVisaOrMastercard = cleanCardNumber.startsWith('4') || cleanCardNumber.startsWith('5');
+  
+  // Local card checks (Uzcard starts with 8600/5614, Humo starts with 9860/5440)
+  const isLocalCard = cleanCardNumber.startsWith('8600') || 
+                      cleanCardNumber.startsWith('9860') || 
+                      cleanCardNumber.startsWith('5614') || 
+                      cleanCardNumber.startsWith('5440');
+
+  const isVisaOrMastercard = !isLocalCard && (cleanCardNumber.startsWith('4') || cleanCardNumber.startsWith('5'));
 
 
   useEffect(() => {
@@ -33,6 +53,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
       setExpiry('');
       setOtp('');
       setError('');
+      setMaskedPhone('');
     }
   }, [isOpen]);
 
@@ -70,7 +91,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
             amount,
             card_name: cardName,
             cvc2: cvc,
-            ext_id: crypto.randomUUID(),
+            ext_id: generateUUID(),
           }),
         });
         const txData = await res.json();
@@ -106,7 +127,12 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
           }),
         });
         const preData = await preRes.json();
+        console.log('[PRE-APPLY RESPONSE]', preData);
         if (!preRes.ok) throw new Error(preData.error || preData.result?.description);
+
+        // Save masked phone number returned from Atmos API if present
+        const phone = preData.phone || preData.phone_number || preData.phoneMask || (preData.payload && preData.payload.phone) || '';
+        setMaskedPhone(phone);
 
         setStep('otp');
       }
@@ -278,7 +304,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
             </div>
             <h3 className="text-2xl text-white font-syne mb-2">Confirmation Code</h3>
             <p className="text-gray-400 text-sm mb-6">
-              An SMS with a 6-digit code has been sent to your phone number.
+              An SMS with a 6-digit code has been sent to your phone number{maskedPhone ? ` (${maskedPhone})` : ''}.
             </p>
 
             <form onSubmit={handleOtpSubmit} className="space-y-4">
@@ -351,12 +377,12 @@ const PaymentPage = ({ settings, setUsers }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
   const [ragflowResult, setRagflowResult] = useState(null); // provisioning result
-  const [selectedTier, setSelectedTier] = useState('basic');
+  const [selectedTier, setSelectedTier] = useState('pro');
   const [selectedMonths, setSelectedMonths] = useState(1);
 
   const TIERS = {
-    basic: { label: 'Basic', pricePerMonth: 199000 },
-    pro:   { label: 'Pro',   pricePerMonth: 399000 },
+    pro:        { label: 'Pro',        pricePerMonth: 370000 },
+    enterprise: { label: 'Enterprise', pricePerMonth: 1260000 },
   };
 
   const PERIODS = [
@@ -385,7 +411,7 @@ const PaymentPage = ({ settings, setUsers }) => {
     setIsModalOpen(true);
   };
 
-  const handlePaymentSuccess = () => {
+  const handlePaymentSuccess = async () => {
     const startDate = new Date();
     const expiryDate = new Date();
     expiryDate.setDate(startDate.getDate() + currentPlan.duration);
@@ -629,7 +655,7 @@ const AdminPanel = ({ settings, setSettings, users, setUsers }) => {
 
   // Form states for manual user add
   const [newUserEmail, setNewUserEmail] = useState('');
-  const [newUserPlan, setNewUserPlan] = useState('Basic');
+  const [newUserPlan, setNewUserPlan] = useState('Pro');
 
   const handleLogin = (e) => {
     e.preventDefault();

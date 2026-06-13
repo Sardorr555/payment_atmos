@@ -8,6 +8,9 @@ import { provisionUser, listUsers, findUserByEmail } from './ragflow.js';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust reverse proxy (Nginx) for rate limiter IP detection
+app.set('trust proxy', 1);
+
 // ─────────────────────────────────────────────
 //  Middleware
 // ─────────────────────────────────────────────
@@ -116,6 +119,7 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
     });
 
     const data = await atmosRes.json();
+    console.log('[ATMOS PRE-APPLY RESPONSE]', JSON.stringify(data, null, 2));
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/pre-apply]', err.message);
@@ -155,6 +159,7 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
     });
 
     const data = await atmosRes.json();
+    console.log('[ATMOS APPLY RESPONSE]', JSON.stringify(data, null, 2));
 
     // Extra check: only return success if Atmos confirms it
     if (data?.result?.code !== 'OK') {
