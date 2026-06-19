@@ -157,6 +157,31 @@ export const provisionUser = async ({ email, plan, months, expiryDate }) => {
     console.log(`[RAGFlow] Existing user found for ${email} — activating subscription`);
   }
 
+  // Call backend to update the database plan_type, plan_expiry_date, and credit
+  try {
+    const adminToken = await getAdminToken();
+    const provRes = await fetch(`${BASE}/api/v1/system/provision`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: adminToken,
+      },
+      body: JSON.stringify({
+        email,
+        plan,
+        months,
+      }),
+    });
+    const provData = await provRes.json();
+    if (provData.code !== 0) {
+      throw new Error(provData.message || 'Provisioning API failed');
+    }
+    console.log(`[RAGFlow] Plan ${plan} successfully provisioned for ${email}`);
+  } catch (err) {
+    console.error('[RAGFlow] Plan provisioning database update failed:', err.message);
+    throw err;
+  }
+
   return {
     isNewUser,
     tempPassword,       // only set for new users — should be emailed to them
