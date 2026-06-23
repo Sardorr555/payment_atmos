@@ -68,21 +68,33 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
 
     const token = await getAtmosToken();
 
+    const requestBody = {
+      amount: Math.round(Number(amount) * 100), // тийины
+      account,
+      store_id: Number(process.env.ATMOS_STORE_ID),
+      lang,
+    };
+    console.log('[ATMOS PAY CREATE REQUEST]', JSON.stringify(requestBody, null, 2));
+
     const atmosRes = await fetch(`${process.env.ATMOS_BASE_URL}/merchant/pay/create`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        amount: Math.round(Number(amount) * 100), // тийины
-        account,
-        store_id: Number(process.env.ATMOS_STORE_ID),
-        lang,
-      }),
+      body: JSON.stringify(requestBody),
     });
 
     const data = await atmosRes.json();
+    console.log('[ATMOS PAY CREATE RESPONSE]', JSON.stringify(data, null, 2));
+
+    if (!data.transaction_id) {
+      return res.status(400).json({
+        error: data.result?.description || 'Failed to create Atmos transaction',
+        detail: data
+      });
+    }
+
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/create]', err.message);
