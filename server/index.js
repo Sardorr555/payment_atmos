@@ -295,14 +295,32 @@ app.post('/api/ragflow/provision', async (req, res) => {
 
     const result = await provisionUser({ email, plan, months, expiryDate });
 
+    let licenseKey = null;
+    const isLicensePlan = plan && plan.toLowerCase().includes('license');
+    if (isLicensePlan) {
+      const expDate = new Date();
+      expDate.setDate(expDate.getDate() + Number(months || 1) * 30);
+      const expStr = expDate.toISOString().split('T')[0]; // YYYY-MM-DD
+      const payload = {
+        owner: email,
+        expiry: expStr,
+        type: Number(months || 1) >= 12 ? 'yearly' : '6-month'
+      };
+      const b64 = Buffer.from(JSON.stringify(payload)).toString('base64');
+      licenseKey = `SWIPIES-ACT-${b64}`;
+    }
+
     res.json({
       success: true,
       isNewUser: result.isNewUser,
       tempPassword: result.tempPassword, // only set for new users
       ragflowUrl: process.env.RAGFLOW_BASE_URL,
-      message: result.isNewUser
-        ? `Account created at ${process.env.RAGFLOW_BASE_URL}. Credentials sent to ${email}.`
-        : `Subscription activated for existing account ${email}.`,
+      licenseKey,
+      message: licenseKey
+        ? `License key generated successfully!`
+        : (result.isNewUser
+            ? `Account created at ${process.env.RAGFLOW_BASE_URL}. Credentials sent to ${email}.`
+            : `Subscription activated for existing account ${email}.`),
     });
   } catch (err) {
     console.error('[/api/ragflow/provision]', err.message);
