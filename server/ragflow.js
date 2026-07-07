@@ -64,7 +64,7 @@ const getAdminToken = async () => {
 
   const encPsw = encryptPassword(password);
 
-  const res = await fetch(`${BASE}/v1/user/login`, {
+  const res = await fetch(`${BASE}/api/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password: encPsw }),
@@ -119,7 +119,7 @@ export const registerUser = async (email, nickname) => {
   const plainPassword = generatePassword();
   const encPsw = encryptPassword(plainPassword);
 
-  const res = await fetch(`${BASE}/v1/user/register`, {
+  const res = await fetch(`${BASE}/api/v1/users`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
