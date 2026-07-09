@@ -2,21 +2,20 @@
  * ragflow.js — RAGFlow user provisioning service
  *
  * Handles:
- *  - Admin login → session token
- *  - Password RSA encryption (required by RAGFlow)
- *  - User registration (if not exists)
- *  - User lookup by email
- *  - Subscription status update via user nickname/metadata
+ *  - Admin auth → prefers RAGFLOW_API_KEY (no session invalidation)
+ *    Falls back to email/password login via /v1/auth/login
+ *  - Password RSA encryption (required by RAGFlow login)
+ *  - Subscription provisioning via /api/v1/system/provision
  */
 
 import crypto from 'crypto';
 import fs from 'fs';
 import fetch from 'node-fetch';
 
-const BASE = process.env.RAGFLOW_BASE_URL; // e.g. https://swipies.app
+const BASE = process.env.RAGFLOW_BASE_URL; // e.g. https://app.swipies.app
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  RSA Password encryption (RAGFlow requires this for login & register)
+//  RSA Password encryption (RAGFlow requires this for login)
 // ─────────────────────────────────────────────────────────────────────────────
 let _publicKey = null;
 
@@ -35,40 +34,56 @@ const getPublicKey = () => {
 
 const encryptPassword = (plainPassword) => {
   const publicKey = getPublicKey();
-  // Step 1: base64-encode the plain password
   const b64Password = Buffer.from(plainPassword, 'utf-8').toString('base64');
-  // Step 2: RSA-encrypt with PKCS1 padding
   const encrypted = crypto.publicEncrypt(
     { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
     Buffer.from(b64Password, 'utf-8')
   );
-  // Step 3: base64-encode the result
   return encrypted.toString('base64');
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Admin session (cached, refreshed on expiry)
+//  Admin auth token
+//
+//  Priority:
+//    1. RAGFLOW_API_KEY env var  → use directly, no login needed, no session kill
+//    2. RAGFLOW_ADMIN_EMAIL + RAGFLOW_ADMIN_PASSWORD → login via /v1/auth/login
 // ─────────────────────────────────────────────────────────────────────────────
 let _adminToken = null;
 let _adminTokenExpiry = 0;
 
 const getAdminToken = async () => {
+  // ── Option 1: static API key (preferred — won't invalidate user sessions) ──
+  const apiKey = process.env.RAGFLOW_API_KEY;
+  if (apiKey) {
+    return apiKey;
+  }
+
+  // ── Option 2: email/password session login ──
   if (_adminToken && Date.now() < _adminTokenExpiry) return _adminToken;
 
   const email = process.env.RAGFLOW_ADMIN_EMAIL;
   const password = process.env.RAGFLOW_ADMIN_PASSWORD;
 
   if (!email || !password) {
-    throw new Error('RAGFLOW_ADMIN_EMAIL and RAGFLOW_ADMIN_PASSWORD must be set in server/.env');
+    throw new Error(
+      'Set either RAGFLOW_API_KEY (recommended) or both RAGFLOW_ADMIN_EMAIL and RAGFLOW_ADMIN_PASSWORD in server/.env'
+    );
   }
 
   const encPsw = encryptPassword(password);
 
-  const res = await fetch(`${BASE}/api/v1/auth/login`, {
+  // Correct RAGFlow v0.26.x login endpoint: /v1/auth/login
+  const res = await fetch(`${BASE}/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password: encPsw }),
   });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`RAGFlow admin login failed: ${text}`);
+  }
 
   const data = await res.json();
 
@@ -76,16 +91,16 @@ const getAdminToken = async () => {
     throw new Error(`RAGFlow admin login failed: ${data.message}`);
   }
 
-  // Token is valid for ~24h; refresh every 20h to be safe
+  // Token valid ~24h; refresh every 20h to be safe
   _adminToken = data.data.token;
   _adminTokenExpiry = Date.now() + 20 * 60 * 60 * 1000;
 
-  console.log('[RAGFlow] Admin session refreshed');
+  console.log('[RAGFlow] Admin session refreshed via email/password login');
   return _adminToken;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Get all users (admin endpoint)
+//  Get all users (admin endpoint on port 9381 via /api/v1/admin/users)
 // ─────────────────────────────────────────────────────────────────────────────
 export const listUsers = async () => {
   const token = await getAdminToken();
@@ -93,6 +108,11 @@ export const listUsers = async () => {
   const res = await fetch(`${BASE}/api/v1/admin/users`, {
     headers: { Authorization: token },
   });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to list RAGFlow users: ${text}`);
+  }
 
   const data = await res.json();
   if (data.code !== 0) throw new Error(data.message || 'Failed to list RAGFlow users');
@@ -103,15 +123,20 @@ export const listUsers = async () => {
 //  Find user by email
 // ─────────────────────────────────────────────────────────────────────────────
 export const findUserByEmail = async (email) => {
-  const users = await listUsers();
-  return users.find((u) => u.email?.toLowerCase() === email.toLowerCase()) || null;
+  try {
+    const users = await listUsers();
+    return users.find((u) => u.email?.toLowerCase() === email.toLowerCase()) || null;
+  } catch (err) {
+    // Non-fatal: if user listing fails, we proceed without user lookup
+    console.warn('[RAGFlow] Could not list users:', err.message);
+    return null;
+  }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Register a new user in RAGFlow
 // ─────────────────────────────────────────────────────────────────────────────
 const generatePassword = () => {
-  // 12-char random password: letters + digits
   return crypto.randomBytes(9).toString('base64').slice(0, 12).replace(/[+/=]/g, 'X');
 };
 
@@ -133,63 +158,57 @@ export const registerUser = async (email, nickname) => {
   if (data.code !== 0) throw new Error(data.message || 'RAGFlow registration failed');
 
   console.log(`[RAGFlow] Registered new user: ${email}`);
-  return { ...data.data, plainPassword }; // return generated password so we can email it
+  return { ...data.data, plainPassword };
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Main: Provision user after payment
-//  - If user exists → update nickname with plan info (activation signal)
-//  - If user doesn't exist → register them + return temp password
+//  Main: Provision user after successful payment
+//
+//  Calls /api/v1/system/provision which updates plan_type + plan_expiry_date
+//  in the RAGFlow database without touching the user's active session.
 // ─────────────────────────────────────────────────────────────────────────────
-export const provisionUser = async ({ email, plan, months, expiryDate }) => {
-  let user = await findUserByEmail(email);
-  let isNewUser = false;
-  let tempPassword = null;
+export const provisionUser = async ({ email, plan, months, expiryDate, license_name }) => {
+  const adminToken = await getAdminToken();
 
-  if (!user) {
-    // Register new user
-    const result = await registerUser(email, email.split('@')[0]);
-    tempPassword = result.plainPassword;
-    user = result;
-    isNewUser = true;
-    console.log(`[RAGFlow] New user created for ${email}`);
-  } else {
-    console.log(`[RAGFlow] Existing user found for ${email} — activating subscription`);
-  }
+  // ── Step 1: Provision the plan in RAGFlow DB ──
+  console.log(`[RAGFlow] Provisioning plan="${plan}" months=${months} for ${email}`);
 
-  // Call backend to update the database plan_type, plan_expiry_date, and credit
+  const provRes = await fetch(`${BASE}/api/v1/system/provision`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: adminToken,
+    },
+    body: JSON.stringify({
+      email,
+      plan,
+      months,
+      license_name: license_name || undefined,
+    }),
+  });
+
+  let provData;
   try {
-    const adminToken = await getAdminToken();
-    const provRes = await fetch(`${BASE}/api/v1/system/provision`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: adminToken,
-      },
-      body: JSON.stringify({
-        email,
-        plan,
-        months,
-      }),
-    });
-    const provData = await provRes.json();
-    if (provData.code !== 0) {
-      throw new Error(provData.message || 'Provisioning API failed');
-    }
-    console.log(`[RAGFlow] Plan ${plan} successfully provisioned for ${email}`);
-  } catch (err) {
-    console.error('[RAGFlow] Plan provisioning database update failed:', err.message);
-    throw err;
+    provData = await provRes.json();
+  } catch {
+    const raw = await provRes.text();
+    throw new Error(`RAGFlow provision returned non-JSON (${provRes.status}): ${raw.slice(0, 200)}`);
   }
+
+  if (!provRes.ok || provData.code !== 0) {
+    throw new Error(provData.message || `Provisioning failed (HTTP ${provRes.status})`);
+  }
+
+  console.log(`[RAGFlow] ✅ Plan "${plan}" provisioned for ${email}`);
 
   return {
-    isNewUser,
-    tempPassword,       // only set for new users — should be emailed to them
-    userId: user?.id,
+    success: true,
     email,
     plan,
     months,
     expiryDate,
+    licenseKey: provData.data?.license_key || null,
     ragflowUrl: BASE,
   };
 };
+
