@@ -260,12 +260,12 @@ app.post('/api/webhook/atmos', async (req, res) => {
     const payload = req.body;
     console.log('[WEBHOOK] Atmos notification received:', JSON.stringify(payload, null, 2));
 
-    const { email, plan, months, expiryDate } = payload;
+    const { email, plan, months, expiryDate, license_name } = payload;
 
     // Auto-provision RAGFlow user after confirmed payment
     if (email && payload.confirmed) {
       try {
-        const result = await provisionUser({ email, plan, months, expiryDate });
+        const result = await provisionUser({ email, plan, months, expiryDate, license_name });
         console.log('[WEBHOOK] RAGFlow provisioning:', result);
       } catch (rfErr) {
         console.error('[WEBHOOK] RAGFlow provisioning failed:', rfErr.message);
@@ -287,17 +287,17 @@ app.post('/api/webhook/atmos', async (req, res) => {
 // ─────────────────────────────────────────────
 app.post('/api/ragflow/provision', async (req, res) => {
   try {
-    const { email, plan, months, expiryDate } = req.body;
+    const { email, plan, months, expiryDate, license_name } = req.body;
 
     if (!email) {
       return res.status(400).json({ error: 'email is required' });
     }
 
-    const result = await provisionUser({ email, plan, months, expiryDate });
+    const result = await provisionUser({ email, plan, months, expiryDate, license_name });
 
-    let licenseKey = null;
+    let licenseKey = result.licenseKey;
     const isLicensePlan = plan && plan.toLowerCase().includes('license');
-    if (isLicensePlan) {
+    if (!licenseKey && isLicensePlan) {
       const expDate = new Date();
       expDate.setDate(expDate.getDate() + Number(months || 1) * 30);
       const expStr = expDate.toISOString().split('T')[0]; // YYYY-MM-DD
