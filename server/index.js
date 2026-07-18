@@ -31,11 +31,24 @@ const paymentLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const isMockMode = process.env.MOCK_PAYMENT === 'true' || 
+                   !process.env.ATMOS_KEY || 
+                   process.env.ATMOS_KEY.includes('YOUR_') || 
+                   process.env.ATMOS_KEY === 'TpLRLagJ1SXiZ0dT_om5BT_I3Nga' ||
+                   !process.env.ATMOS_SECRET || 
+                   process.env.ATMOS_SECRET === 'bMH7gjat2EgI3fTXoLJX7CRUcbAa';
+
+console.log(`[ATMOS INTEGRATION] Mock mode: ${isMockMode}`);
+
 // ─────────────────────────────────────────────
 //  Atmos Auth helper — runs on the SERVER only
 //  API keys never leave this file
 // ─────────────────────────────────────────────
 const getAtmosToken = async () => {
+  if (isMockMode) {
+    return 'mock-token';
+  }
+
   const auth = Buffer.from(
     `${process.env.ATMOS_KEY}:${process.env.ATMOS_SECRET}`
   ).toString('base64');
@@ -64,6 +77,16 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
 
     if (!amount || !account) {
       return res.status(400).json({ error: 'amount and account are required' });
+    }
+
+    if (isMockMode) {
+      const mockTx = {
+        transaction_id: 'mock-tx-' + Math.random().toString(36).substr(2, 9),
+        amount: amount,
+        mock: true
+      };
+      console.log('[MOCK ATMOS PAY CREATE]', JSON.stringify(mockTx));
+      return res.json(mockTx);
     }
 
     const token = await getAtmosToken();
@@ -114,6 +137,17 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
       return res.status(400).json({ error: 'transaction_id, card_number and expiry are required' });
     }
 
+    if (isMockMode) {
+      const mockPre = {
+        status: 'waiting_otp',
+        phone: '+998 90 *** ** 99',
+        phone_number: '+998 90 *** ** 99',
+        mock: true
+      };
+      console.log('[MOCK ATMOS PRE-APPLY]', JSON.stringify(mockPre));
+      return res.json(mockPre);
+    }
+
     const token = await getAtmosToken();
 
     const atmosRes = await fetch(`${process.env.ATMOS_BASE_URL}/merchant/pay/pre-apply`, {
@@ -153,6 +187,18 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
 
     if (!/^\d{6}$/.test(otp)) {
       return res.status(400).json({ error: 'OTP must be exactly 6 digits' });
+    }
+
+    if (isMockMode) {
+      const mockApply = {
+        result: {
+          code: 'OK',
+          description: 'Success'
+        },
+        mock: true
+      };
+      console.log('[MOCK ATMOS APPLY]', JSON.stringify(mockApply));
+      return res.json(mockApply);
     }
 
     const token = await getAtmosToken();
@@ -195,6 +241,21 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
 
     if (!pan || !expiry || !amount || !card_name || !cvc2 || !ext_id) {
       return res.status(400).json({ error: 'All card fields are required' });
+    }
+
+    if (isMockMode) {
+      const mockMps = {
+        status: {
+          code: 0,
+          message: 'Success'
+        },
+        payload: {
+          id: 'mock-mps-tx-' + Math.random().toString(36).substr(2, 9)
+        },
+        mock: true
+      };
+      console.log('[MOCK ATMOS MPS]', JSON.stringify(mockMps));
+      return res.json(mockMps);
     }
 
     const token = await getAtmosToken();
@@ -287,7 +348,7 @@ app.post('/api/webhook/atmos', async (req, res) => {
 // ─────────────────────────────────────────────
 app.post('/api/ragflow/provision', async (req, res) => {
   try {
-    const { email, plan, months, expiryDate } = req.body;
+    const { email, plan, months, expiryDate, amount, payment_id } = req.body;
 
     if (!email) {
       return res.status(400).json({ error: 'email is required' });
@@ -304,7 +365,10 @@ app.post('/api/ragflow/provision', async (req, res) => {
       const payload = {
         owner: email,
         expiry: expStr,
-        type: Number(months || 1) >= 12 ? 'yearly' : '6-month'
+        type: Number(months || 1) >= 12 ? 'yearly' : '6-month',
+        amount: amount || (Number(months || 1) >= 12 ? 500000 : 300000),
+        payment_id: payment_id || 'manual-activation',
+        activated_at: new Date().toISOString().replace('T', ' ').substring(0, 19)
       };
       const b64 = Buffer.from(JSON.stringify(payload)).toString('base64');
       licenseKey = `SWIPIES-ACT-${b64}`;
