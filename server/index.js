@@ -35,7 +35,7 @@ process.env.ATMOS_KEY = process.env.ATMOS_KEY || 'TpLRLagJ1SXiZ0dT_om5BT_I3Nga';
 process.env.ATMOS_SECRET = process.env.ATMOS_SECRET || 'bMH7gjat2EgI3fTXoLJX7CRUcbAa';
 process.env.ATMOS_STORE_ID = process.env.ATMOS_STORE_ID || '100506';
 
-const defaultAtmosUrl = 'https://partner.atmos.uz';
+const defaultAtmosUrl = 'https://apigw.atmos.uz';
 process.env.ATMOS_BASE_URL = process.env.ATMOS_BASE_URL || defaultAtmosUrl;
 
 const isMockMode = process.env.MOCK_PAYMENT === 'true' || 
@@ -99,7 +99,7 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     const requestBody = {
       amount: Math.round(Number(amount) * 100), // тийины
       account,
-      store_id: Number(process.env.ATMOS_STORE_ID),
+      store_id: String(process.env.ATMOS_STORE_ID),
       lang,
     };
     console.log('[ATMOS PAY CREATE REQUEST]', JSON.stringify(requestBody, null, 2));
@@ -165,7 +165,7 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
         transaction_id,
         card_number,
         expiry,
-        store_id: Number(process.env.ATMOS_STORE_ID),
+        store_id: String(process.env.ATMOS_STORE_ID),
       }),
     });
 
@@ -217,7 +217,7 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
       body: JSON.stringify({
         transaction_id,
         otp,
-        store_id: Number(process.env.ATMOS_STORE_ID),
+        store_id: String(process.env.ATMOS_STORE_ID),
       }),
     });
 
@@ -276,7 +276,7 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
       body: JSON.stringify({
         amount: Math.round(Number(amount) * 100),
         ext_id,
-        store_id: Number(process.env.ATMOS_STORE_ID),
+        store_id: String(process.env.ATMOS_STORE_ID),
         ofd_items: [],
         account: ext_id,
       }),
