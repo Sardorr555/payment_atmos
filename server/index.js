@@ -99,7 +99,7 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     const requestBody = {
       amount: Math.round(Number(amount) * 100), // тийины
       account,
-      store_id: String(process.env.ATMOS_STORE_ID),
+      store_id: Number(process.env.ATMOS_STORE_ID),
       lang,
     };
     console.log('[ATMOS PAY CREATE REQUEST]', JSON.stringify(requestBody, null, 2));
@@ -166,10 +166,10 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
-        transaction_id,
+        transaction_id: Number(transaction_id),
         card_number,
         expiry,
-        store_id: String(process.env.ATMOS_STORE_ID),
+        store_id: Number(process.env.ATMOS_STORE_ID),
       }),
     });
 
@@ -227,9 +227,9 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
-        transaction_id,
+        transaction_id: Number(transaction_id),
         otp,
-        store_id: String(process.env.ATMOS_STORE_ID),
+        store_id: Number(process.env.ATMOS_STORE_ID),
       }),
     });
 
@@ -288,7 +288,7 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
       body: JSON.stringify({
         amount: Math.round(Number(amount) * 100),
         ext_id,
-        store_id: String(process.env.ATMOS_STORE_ID),
+        store_id: Number(process.env.ATMOS_STORE_ID),
         ofd_items: [],
         account: ext_id,
       }),
