@@ -35,9 +35,7 @@ process.env.ATMOS_KEY = process.env.ATMOS_KEY || 'TpLRLagJ1SXiZ0dT_om5BT_I3Nga';
 process.env.ATMOS_SECRET = process.env.ATMOS_SECRET || 'bMH7gjat2EgI3fTXoLJX7CRUcbAa';
 process.env.ATMOS_STORE_ID = process.env.ATMOS_STORE_ID || '100506';
 
-const defaultAtmosUrl = process.env.ATMOS_KEY === 'TpLRLagJ1SXiZ0dT_om5BT_I3Nga' 
-  ? 'https://api.atmos.uz' 
-  : 'https://sandbox-api.atmos.uz';
+const defaultAtmosUrl = 'https://partner.atmos.uz';
 process.env.ATMOS_BASE_URL = process.env.ATMOS_BASE_URL || defaultAtmosUrl;
 
 const isMockMode = process.env.MOCK_PAYMENT === 'true' || 
