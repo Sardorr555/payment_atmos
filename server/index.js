@@ -117,8 +117,12 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     console.log('[ATMOS PAY CREATE RESPONSE]', JSON.stringify(data, null, 2));
 
     if (!data.transaction_id) {
+      let errorMsg = data.result?.description || 'Failed to create Atmos transaction';
+      if (data.result?.code === 102 || String(data.result?.code).includes('102')) {
+        errorMsg = 'SMS gateway error (code 102): SMS was not sent. Ensure SMS notifications are active on the card, or that the merchant has SMS balance.';
+      }
       return res.status(400).json({
-        error: data.result?.description || 'Failed to create Atmos transaction',
+        error: errorMsg,
         detail: data
       });
     }
@@ -171,6 +175,14 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
 
     const data = await atmosRes.json();
     console.log('[ATMOS PRE-APPLY RESPONSE]', JSON.stringify(data, null, 2));
+
+    if (data?.result?.code && data.result.code !== 'OK' && data.result.code !== 1) {
+      let errorMsg = data.result.description || 'Card validation/OTP request failed';
+      if (data.result.code === 102 || String(data.result.code).includes('102')) {
+        errorMsg = 'SMS gateway error (code 102): SMS was not sent. Ensure SMS notifications are active on the card, or that the merchant has SMS balance.';
+      }
+      return res.status(400).json({ error: errorMsg, detail: data });
+    }
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/pre-apply]', err.message);
