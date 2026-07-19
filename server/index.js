@@ -43,6 +43,18 @@ const isMockMode = process.env.MOCK_PAYMENT === 'true' ||
                    process.env.ATMOS_KEY.includes('YOUR_') || 
                    !process.env.ATMOS_SECRET;
 
+function normalizeExpiry(expiry) {
+  const clean = String(expiry).replace(/[^0-9]/g, '');
+  if (clean.length === 4) {
+    const firstTwo = parseInt(clean.substring(0, 2), 10);
+    const lastTwo = parseInt(clean.substring(2, 4), 10);
+    if (firstTwo <= 12 && lastTwo > 12) {
+      return clean.substring(2, 4) + clean.substring(0, 2);
+    }
+  }
+  return clean;
+}
+
 console.log(`[ATMOS INTEGRATION] Mock mode: ${isMockMode}, Base URL: ${process.env.ATMOS_BASE_URL}`);
 
 // ─────────────────────────────────────────────
@@ -99,7 +111,7 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     const requestBody = {
       amount: Math.round(Number(amount) * 100), // тийины
       account,
-      store_id: Number(process.env.ATMOS_STORE_ID),
+      store_id: String(process.env.ATMOS_STORE_ID),
       lang,
     };
     console.log('[ATMOS PAY CREATE REQUEST]', JSON.stringify(requestBody, null, 2));
@@ -117,20 +129,20 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     console.log('[ATMOS PAY CREATE RESPONSE]', JSON.stringify(data, null, 2));
 
     if (!data.transaction_id) {
-      console.warn('[ATMOS] Production transaction creation failed. Falling back to MOCK mode.');
-      return res.json({
-        transaction_id: 'mock-tx-' + Math.random().toString(36).substr(2, 9),
-        mock: true
+      let errorMsg = data.result?.description || 'Failed to create Atmos transaction';
+      if (data.result?.code === 102 || String(data.result?.code).includes('102')) {
+        errorMsg = 'SMS gateway error (code 102): SMS was not sent. Ensure SMS notifications are active on the card, or that the merchant has SMS balance.';
+      }
+      return res.status(400).json({
+        error: errorMsg,
+        detail: data
       });
     }
 
     res.json(data);
   } catch (err) {
-    console.error('[/api/pay/create] Error, falling back to mock:', err.message);
-    res.json({
-      transaction_id: 'mock-tx-' + Math.random().toString(36).substr(2, 9),
-      mock: true
-    });
+    console.error('[/api/pay/create]', err.message);
+    res.status(502).json({ error: 'Payment gateway error', detail: err.message });
   }
 });
 
@@ -159,6 +171,8 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
 
     const token = await getAtmosToken();
 
+    const normalizedExpiry = normalizeExpiry(expiry);
+
     const atmosRes = await fetch(`${process.env.ATMOS_BASE_URL}/merchant/pay/pre-apply`, {
       method: 'POST',
       headers: {
@@ -168,8 +182,8 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
       body: JSON.stringify({
         transaction_id: Number(transaction_id),
         card_number,
-        expiry,
-        store_id: Number(process.env.ATMOS_STORE_ID),
+        expiry: normalizedExpiry,
+        store_id: String(process.env.ATMOS_STORE_ID),
       }),
     });
 
@@ -177,24 +191,16 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
     console.log('[ATMOS PRE-APPLY RESPONSE]', JSON.stringify(data, null, 2));
 
     if (data?.result?.code && data.result.code !== 'OK' && data.result.code !== 1) {
-      console.warn('[ATMOS] pre-apply failed, falling back to mock OTP:', data.result.description);
-      return res.json({
-        status: 'waiting_otp',
-        phone: '+998 90 *** ** 99',
-        phone_number: '+998 90 *** ** 99',
-        mock: true,
-        fallback: true
-      });
+      let errorMsg = data.result.description || 'Card validation/OTP request failed';
+      if (data.result.code === 102 || String(data.result.code).includes('102')) {
+        errorMsg = 'SMS gateway error (code 102): SMS was not sent. Ensure SMS notifications are active on the card, or that the merchant has SMS balance.';
+      }
+      return res.status(400).json({ error: errorMsg, detail: data });
     }
     res.json(data);
   } catch (err) {
-    console.error('[/api/pay/pre-apply] Error, falling back to mock OTP:', err.message);
-    res.json({
-      status: 'waiting_otp',
-      phone: '+998 90 *** ** 99',
-      phone_number: '+998 90 *** ** 99',
-      mock: true
-    });
+    console.error('[/api/pay/pre-apply]', err.message);
+    res.status(502).json({ error: 'Payment gateway error', detail: err.message });
   }
 });
 
@@ -237,7 +243,7 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
       body: JSON.stringify({
         transaction_id: Number(transaction_id),
         otp,
-        store_id: Number(process.env.ATMOS_STORE_ID),
+        store_id: String(process.env.ATMOS_STORE_ID),
       }),
     });
 
@@ -245,7 +251,7 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
     console.log('[ATMOS APPLY RESPONSE]', JSON.stringify(data, null, 2));
 
     // Extra check: only return success if Atmos confirms it
-    if (data?.result?.code !== 'OK') {
+    if (data?.result?.code !== 'OK' && data?.result?.code !== 1) {
       return res.status(400).json({ error: data?.result?.description || 'Payment failed' });
     }
 
