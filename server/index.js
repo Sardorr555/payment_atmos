@@ -678,8 +678,8 @@ app.get('/api/test-atmos', async (req, res) => {
     if (tokenData.access_token) {
       report.token_obtained = true;
 
-      // Test creating a 100 UZS test transaction
-      console.log('[DIAGNOSTIC TEST] Testing /merchant/pay/create with 100 UZS...');
+      const testAmountUzs = Number(req.query.amount) || 10000;
+      console.log(`[DIAGNOSTIC TEST] Testing /merchant/pay/create with ${testAmountUzs} UZS...`);
       const createRes = await fetch(`${process.env.ATMOS_BASE_URL}/merchant/pay/create`, {
         method: 'POST',
         headers: {
@@ -687,7 +687,7 @@ app.get('/api/test-atmos', async (req, res) => {
           Authorization: `Bearer ${tokenData.access_token}`,
         },
         body: JSON.stringify({
-          amount: 10000, // 100 UZS
+          amount: Math.round(testAmountUzs * 100),
           account: 'diagnostic_test@swipies.app',
           store_id: String(process.env.ATMOS_STORE_ID),
           lang: 'ru'
