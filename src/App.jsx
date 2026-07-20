@@ -31,6 +31,8 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
   const [otp, setOtp] = useState('');
   const [error, setError] = useState('');
   const [hint102Error, setHint102Error] = useState(false);
+  const [rawDetails, setRawDetails] = useState(null);
+  const [showRawDetails, setShowRawDetails] = useState(false);
   const [transactionId, setTransactionId] = useState(null);
   const [cvc, setCvc] = useState('');
   const [cardName, setCardName] = useState('');
@@ -54,6 +56,8 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
       setOtp('');
       setError('');
       setHint102Error(false);
+      setRawDetails(null);
+      setShowRawDetails(false);
       setMaskedPhone('');
     }
   }, [isOpen]);
@@ -125,6 +129,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
         console.log('[ATMOS FRONTEND CREATE RESPONSE]', txData);
 
         if (!createRes.ok) {
+          setRawDetails(txData.detail || txData);
           const is102 = txData.hint === 102 || 
                         txData.detail?.hint === 102 || 
                         txData.detail?.result?.code === 102 ||
@@ -154,6 +159,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
         console.log('[ATMOS FRONTEND PRE-APPLY RESPONSE]', preData);
 
         if (!preRes.ok) {
+          setRawDetails(preData.detail || preData);
           const is102 = preData.hint === 102 || 
                         preData.detail?.hint === 102 || 
                         preData.detail?.result?.code === 102 ||
@@ -347,6 +353,23 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
               ) : error ? (
                 <p className="text-red-400 text-sm text-center my-2">{error}</p>
               ) : null}
+
+              {rawDetails && (
+                <div className="my-2 text-left">
+                  <button
+                    type="button"
+                    onClick={() => setShowRawDetails(!showRawDetails)}
+                    className="text-[11px] text-gray-400 underline hover:text-white transition-colors"
+                  >
+                    {showRawDetails ? '▼ Скрыть сырой ответ Atmos API' : '▶ Показать сырой ответ Atmos API'}
+                  </button>
+                  {showRawDetails && (
+                    <pre className="mt-1 p-3 bg-navy-950/90 rounded-xl border border-white/10 text-[10px] text-red-300 font-mono overflow-x-auto max-h-36 select-all">
+                      {JSON.stringify(rawDetails, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              )}
 
               <button
                 type="submit"

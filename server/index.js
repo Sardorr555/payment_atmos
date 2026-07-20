@@ -43,6 +43,32 @@ const isMockMode = process.env.MOCK_PAYMENT === 'true' ||
                    process.env.ATMOS_KEY.includes('YOUR_') || 
                    !process.env.ATMOS_SECRET;
 
+// ─────────────────────────────────────────────
+//  In-memory log ring buffer for live diagnostics
+// ─────────────────────────────────────────────
+const recentLogs = [];
+const MAX_LOGS = 200;
+
+function addLog(type, args) {
+  const time = new Date().toISOString();
+  const line = `[${time}] [${type.toUpperCase()}] ` + args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+  recentLogs.push(line);
+  if (recentLogs.length > MAX_LOGS) recentLogs.shift();
+}
+
+const origLog = console.log;
+const origErr = console.error;
+
+console.log = (...args) => {
+  origLog(...args);
+  addLog('info', args);
+};
+
+console.error = (...args) => {
+  origErr(...args);
+  addLog('error', args);
+};
+
 function maskCard(card) {
   if (!card) return '****';
   const clean = String(card).replace(/\s/g, '');
@@ -609,6 +635,75 @@ app.get('/api/health', (req, res) => {
     mock_mode: isMockMode,
     timestamp: new Date().toISOString(),
   });
+});
+
+// ─────────────────────────────────────────────
+//  ROUTE: Live Server Logs
+//  GET /api/logs
+// ─────────────────────────────────────────────
+app.get('/api/logs', (req, res) => {
+  res.json({ logs: recentLogs });
+});
+
+// ─────────────────────────────────────────────
+//  ROUTE: Diagnostic Test of Atmos Credentials & API
+//  GET /api/test-atmos
+// ─────────────────────────────────────────────
+app.get('/api/test-atmos', async (req, res) => {
+  const report = {
+    timestamp: new Date().toISOString(),
+    base_url: process.env.ATMOS_BASE_URL,
+    store_id: process.env.ATMOS_STORE_ID,
+    key_masked: process.env.ATMOS_KEY ? process.env.ATMOS_KEY.substring(0, 5) + '...' : 'MISSING',
+    mock_mode: isMockMode,
+  };
+
+  try {
+    const auth = Buffer.from(`${process.env.ATMOS_KEY}:${process.env.ATMOS_SECRET}`).toString('base64');
+    console.log('[DIAGNOSTIC TEST] Requesting token from Atmos...');
+    
+    const tokenRes = await fetch(`${process.env.ATMOS_BASE_URL}/token`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+    });
+
+    report.token_http_status = tokenRes.status;
+    const tokenData = await tokenRes.json();
+    report.token_response = tokenData;
+
+    if (tokenData.access_token) {
+      report.token_obtained = true;
+
+      // Test creating a 100 UZS test transaction
+      console.log('[DIAGNOSTIC TEST] Testing /merchant/pay/create with 100 UZS...');
+      const createRes = await fetch(`${process.env.ATMOS_BASE_URL}/merchant/pay/create`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokenData.access_token}`,
+        },
+        body: JSON.stringify({
+          amount: 10000, // 100 UZS
+          account: 'diagnostic_test@swipies.app',
+          store_id: String(process.env.ATMOS_STORE_ID),
+          lang: 'ru'
+        }),
+      });
+
+      report.create_tx_http_status = createRes.status;
+      report.create_tx_response = await createRes.json();
+    } else {
+      report.token_obtained = false;
+    }
+  } catch (err) {
+    report.error = err.message;
+  }
+
+  res.json(report);
 });
 
 // ─────────────────────────────────────────────
