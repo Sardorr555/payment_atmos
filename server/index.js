@@ -43,11 +43,20 @@ const isMockMode = process.env.MOCK_PAYMENT === 'true' ||
                    process.env.ATMOS_KEY.includes('YOUR_') || 
                    !process.env.ATMOS_SECRET;
 
+function maskCard(card) {
+  if (!card) return '****';
+  const clean = String(card).replace(/\s/g, '');
+  if (clean.length < 10) return '****';
+  return clean.substring(0, 6) + '******' + clean.substring(clean.length - 4);
+}
+
 function normalizeExpiry(expiry) {
+  if (!expiry) return '';
   const clean = String(expiry).replace(/[^0-9]/g, '');
   if (clean.length === 4) {
     const firstTwo = parseInt(clean.substring(0, 2), 10);
     const lastTwo = parseInt(clean.substring(2, 4), 10);
+    // If MMYY format (e.g. 1228 where month is 12 <= 12 and year is 28 > 12) -> convert to YYMM
     if (firstTwo <= 12 && lastTwo > 12) {
       return clean.substring(2, 4) + clean.substring(0, 2);
     }
@@ -55,11 +64,45 @@ function normalizeExpiry(expiry) {
   return clean;
 }
 
-console.log(`[ATMOS INTEGRATION] Mock mode: ${isMockMode}, Base URL: ${process.env.ATMOS_BASE_URL}`);
+function analyzeAtmosError(data) {
+  if (!data) return null;
+  const code = data?.result?.code ?? data?.code;
+  const hint = data?.hint;
+  const desc = data?.result?.description ?? data?.message ?? data?.description ?? '';
+
+  const is102 = code === 102 || hint === 102 || 
+                String(code).includes('102') || 
+                String(hint).includes('102') || 
+                String(desc).includes('102');
+
+  if (is102) {
+    return {
+      is102: true,
+      code: 102,
+      hint: hint || 102,
+      message: 'SMS gateway error (code 102 / hint 102): SMS was not sent. Ensure SMS notifications are active on the Uzcard/Humo card, or that the merchant has SMS balance.',
+      messageRu: 'Ошибка СМС-шлюза (код 102 / hint 102): СМС с кодом не отправлено. Убедитесь, что на карте Uzcard/Humo подключена услуга СМС-информирования (в мобильном приложении банка или банкомате), либо проверьте баланс СМС мерчанта.'
+    };
+  }
+
+  return {
+    is102: false,
+    code,
+    hint,
+    message: desc || 'Atmos API returned an error response.',
+    messageRu: desc || 'Ошибка проведения платежа через Atmos.'
+  };
+}
+
+console.log(`\n==================================================`);
+console.log(`[ATMOS INTEGRATION SERVER STARTED]`);
+console.log(`  Mock Mode   : ${isMockMode}`);
+console.log(`  Base URL    : ${process.env.ATMOS_BASE_URL}`);
+console.log(`  Store ID    : ${process.env.ATMOS_STORE_ID}`);
+console.log(`==================================================\n`);
 
 // ─────────────────────────────────────────────
 //  Atmos Auth helper — runs on the SERVER only
-//  API keys never leave this file
 // ─────────────────────────────────────────────
 const getAtmosToken = async () => {
   if (isMockMode) {
@@ -70,6 +113,8 @@ const getAtmosToken = async () => {
     `${process.env.ATMOS_KEY}:${process.env.ATMOS_SECRET}`
   ).toString('base64');
 
+  console.log(`[ATMOS AUTH] Requesting token from ${process.env.ATMOS_BASE_URL}/token`);
+
   const res = await fetch(`${process.env.ATMOS_BASE_URL}/token`, {
     method: 'POST',
     headers: {
@@ -79,8 +124,14 @@ const getAtmosToken = async () => {
     body: 'grant_type=client_credentials',
   });
 
-  if (!res.ok) throw new Error(`Atmos auth failed: ${res.status}`);
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error(`[ATMOS AUTH FAILED] Status: ${res.status}, Body: ${errText}`);
+    throw new Error(`Atmos auth failed with status ${res.status}: ${errText}`);
+  }
+
   const data = await res.json();
+  console.log(`[ATMOS AUTH SUCCESS] Token obtained (expires in: ${data.expires_in || 'N/A'}s)`);
   return data.access_token;
 };
 
@@ -89,11 +140,26 @@ const getAtmosToken = async () => {
 //  POST /api/pay/create
 // ─────────────────────────────────────────────
 app.post('/api/pay/create', paymentLimiter, async (req, res) => {
+  const reqTime = new Date().toISOString();
   try {
     const { amount, account, lang = 'ru' } = req.body;
 
+    console.log(`\n==================================================`);
+    console.log(`[ATMOS PAY CREATE REQUEST] ${reqTime}`);
+    console.log(`  Amount   : ${amount} UZS (${Math.round(Number(amount) * 100)} tiyins)`);
+    console.log(`  Account  : ${account}`);
+    console.log(`  Lang     : ${lang}`);
+    console.log(`  Client IP: ${req.ip}`);
+
     if (!amount || !account) {
-      return res.status(400).json({ error: 'amount and account are required' });
+      console.log(`[ATMOS PAY CREATE ERROR] Missing amount or account`);
+      return res.status(400).json({ error: 'Укажите сумму и Email адрес' });
+    }
+
+    const cleanAccount = String(account).trim();
+    if (!cleanAccount.includes('@') || cleanAccount.length < 5) {
+      console.log(`[ATMOS PAY CREATE ERROR] Invalid account email: ${cleanAccount}`);
+      return res.status(400).json({ error: 'Укажите корректный Email адрес (например, user@example.com)' });
     }
 
     if (isMockMode) {
@@ -102,7 +168,7 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
         amount: amount,
         mock: true
       };
-      console.log('[MOCK ATMOS PAY CREATE]', JSON.stringify(mockTx));
+      console.log('[MOCK ATMOS PAY CREATE RESPONSE]', JSON.stringify(mockTx, null, 2));
       return res.json(mockTx);
     }
 
@@ -110,11 +176,11 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
 
     const requestBody = {
       amount: Math.round(Number(amount) * 100), // тийины
-      account,
+      account: String(account),
       store_id: String(process.env.ATMOS_STORE_ID),
       lang,
     };
-    console.log('[ATMOS PAY CREATE REQUEST]', JSON.stringify(requestBody, null, 2));
+    console.log('[ATMOS PAY CREATE API PAYLOAD]', JSON.stringify(requestBody, null, 2));
 
     const atmosRes = await fetch(`${process.env.ATMOS_BASE_URL}/merchant/pay/create`, {
       method: 'POST',
@@ -126,22 +192,24 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     });
 
     const data = await atmosRes.json();
-    console.log('[ATMOS PAY CREATE RESPONSE]', JSON.stringify(data, null, 2));
+    console.log(`[ATMOS PAY CREATE API RESPONSE] Status: ${atmosRes.status}`);
+    console.log(JSON.stringify(data, null, 2));
+
+    const errInfo = analyzeAtmosError(data);
 
     if (!data.transaction_id) {
-      let errorMsg = data.result?.description || 'Failed to create Atmos transaction';
-      if (data.result?.code === 102 || String(data.result?.code).includes('102')) {
-        errorMsg = 'SMS gateway error (code 102): SMS was not sent. Ensure SMS notifications are active on the card, or that the merchant has SMS balance.';
-      }
+      const errorMsg = errInfo?.messageRu || errInfo?.message || data.result?.description || 'Failed to create Atmos transaction';
+      console.error(`[ATMOS PAY CREATE FAILED] ${errorMsg}`);
       return res.status(400).json({
         error: errorMsg,
+        hint: data.hint || (errInfo?.is102 ? 102 : undefined),
         detail: data
       });
     }
 
     res.json(data);
   } catch (err) {
-    console.error('[/api/pay/create]', err.message);
+    console.error('[ATMOS PAY CREATE EXCEPTION]', err);
     res.status(502).json({ error: 'Payment gateway error', detail: err.message });
   }
 });
@@ -151,8 +219,15 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
 //  POST /api/pay/pre-apply
 // ─────────────────────────────────────────────
 app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
+  const reqTime = new Date().toISOString();
   try {
     const { transaction_id, card_number, expiry } = req.body;
+
+    console.log(`\n==================================================`);
+    console.log(`[ATMOS PRE-APPLY REQUEST] ${reqTime}`);
+    console.log(`  Transaction ID : ${transaction_id}`);
+    console.log(`  Card Number    : ${maskCard(card_number)}`);
+    console.log(`  Raw Expiry     : ${expiry}`);
 
     if (!transaction_id || !card_number || !expiry) {
       return res.status(400).json({ error: 'transaction_id, card_number and expiry are required' });
@@ -165,13 +240,25 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
         phone_number: '+998 90 *** ** 99',
         mock: true
       };
-      console.log('[MOCK ATMOS PRE-APPLY]', JSON.stringify(mockPre));
+      console.log('[MOCK ATMOS PRE-APPLY RESPONSE]', JSON.stringify(mockPre, null, 2));
       return res.json(mockPre);
     }
 
     const token = await getAtmosToken();
-
     const normalizedExpiry = normalizeExpiry(expiry);
+    const cleanCard = String(card_number).replace(/\s/g, '');
+
+    const payload = {
+      transaction_id: Number(transaction_id),
+      card_number: cleanCard,
+      expiry: normalizedExpiry,
+      store_id: String(process.env.ATMOS_STORE_ID),
+    };
+
+    console.log('[ATMOS PRE-APPLY API PAYLOAD]', JSON.stringify({
+      ...payload,
+      card_number: maskCard(cleanCard)
+    }, null, 2));
 
     const atmosRes = await fetch(`${process.env.ATMOS_BASE_URL}/merchant/pay/pre-apply`, {
       method: 'POST',
@@ -179,27 +266,33 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        transaction_id: Number(transaction_id),
-        card_number,
-        expiry: normalizedExpiry,
-        store_id: String(process.env.ATMOS_STORE_ID),
-      }),
+      body: JSON.stringify(payload),
     });
 
     const data = await atmosRes.json();
-    console.log('[ATMOS PRE-APPLY RESPONSE]', JSON.stringify(data, null, 2));
+    console.log(`[ATMOS PRE-APPLY API RESPONSE] Status: ${atmosRes.status}`);
+    console.log(JSON.stringify(data, null, 2));
 
-    if (data?.result?.code && data.result.code !== 'OK' && data.result.code !== 1) {
-      let errorMsg = data.result.description || 'Card validation/OTP request failed';
-      if (data.result.code === 102 || String(data.result.code).includes('102')) {
-        errorMsg = 'SMS gateway error (code 102): SMS was not sent. Ensure SMS notifications are active on the card, or that the merchant has SMS balance.';
-      }
-      return res.status(400).json({ error: errorMsg, detail: data });
+    const errInfo = analyzeAtmosError(data);
+
+    const resCode = data?.result?.code ?? data?.code;
+    const isSuccess = (resCode === 'OK' || resCode === 1 || resCode === 0) || 
+                      (!resCode && data?.status === 'waiting_otp') ||
+                      (!data?.result?.code && !data?.code && atmosRes.ok && !errInfo?.is102);
+
+    if (!isSuccess || errInfo?.is102) {
+      const errorMsg = errInfo?.messageRu || errInfo?.message || data?.result?.description || 'Card validation/OTP request failed';
+      console.error(`[ATMOS PRE-APPLY FAILED] Hint/Code: ${data?.hint || resCode} -> ${errorMsg}`);
+      return res.status(400).json({
+        error: errorMsg,
+        hint: data?.hint || (errInfo?.is102 ? 102 : undefined),
+        detail: data
+      });
     }
+
     res.json(data);
   } catch (err) {
-    console.error('[/api/pay/pre-apply]', err.message);
+    console.error('[ATMOS PRE-APPLY EXCEPTION]', err);
     res.status(502).json({ error: 'Payment gateway error', detail: err.message });
   }
 });
@@ -209,8 +302,14 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
 //  POST /api/pay/apply
 // ─────────────────────────────────────────────
 app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
+  const reqTime = new Date().toISOString();
   try {
     const { transaction_id, otp } = req.body;
+
+    console.log(`\n==================================================`);
+    console.log(`[ATMOS APPLY REQUEST] ${reqTime}`);
+    console.log(`  Transaction ID : ${transaction_id}`);
+    console.log(`  OTP            : ${otp ? '******' : 'N/A'}`);
 
     if (!transaction_id || !otp) {
       return res.status(400).json({ error: 'transaction_id and otp are required' });
@@ -228,11 +327,19 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
         },
         mock: true
       };
-      console.log('[MOCK ATMOS APPLY]', JSON.stringify(mockApply));
+      console.log('[MOCK ATMOS APPLY RESPONSE]', JSON.stringify(mockApply, null, 2));
       return res.json(mockApply);
     }
 
     const token = await getAtmosToken();
+
+    const payload = {
+      transaction_id: Number(transaction_id),
+      otp: String(otp).trim(),
+      store_id: String(process.env.ATMOS_STORE_ID),
+    };
+
+    console.log('[ATMOS APPLY API PAYLOAD]', JSON.stringify(payload, null, 2));
 
     const atmosRes = await fetch(`${process.env.ATMOS_BASE_URL}/merchant/pay/apply`, {
       method: 'POST',
@@ -240,24 +347,31 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify({
-        transaction_id: Number(transaction_id),
-        otp,
-        store_id: String(process.env.ATMOS_STORE_ID),
-      }),
+      body: JSON.stringify(payload),
     });
 
     const data = await atmosRes.json();
-    console.log('[ATMOS APPLY RESPONSE]', JSON.stringify(data, null, 2));
+    console.log(`[ATMOS APPLY API RESPONSE] Status: ${atmosRes.status}`);
+    console.log(JSON.stringify(data, null, 2));
 
-    // Extra check: only return success if Atmos confirms it
-    if (data?.result?.code !== 'OK' && data?.result?.code !== 1) {
-      return res.status(400).json({ error: data?.result?.description || 'Payment failed' });
+    const errInfo = analyzeAtmosError(data);
+
+    const resCode = data?.result?.code ?? data?.code;
+    const isSuccess = resCode === 'OK' || resCode === 1 || resCode === '1' || resCode === 0;
+
+    if (!isSuccess) {
+      const errorMsg = errInfo?.messageRu || errInfo?.message || data?.result?.description || 'Payment confirmation failed';
+      console.error(`[ATMOS APPLY FAILED] ${errorMsg}`);
+      return res.status(400).json({
+        error: errorMsg,
+        hint: data?.hint || (errInfo?.is102 ? 102 : undefined),
+        detail: data
+      });
     }
 
     res.json(data);
   } catch (err) {
-    console.error('[/api/pay/apply]', err.message);
+    console.error('[ATMOS APPLY EXCEPTION]', err);
     res.status(502).json({ error: 'Payment gateway error', detail: err.message });
   }
 });
@@ -267,8 +381,16 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
 //  POST /api/pay/mps
 // ─────────────────────────────────────────────
 app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
+  const reqTime = new Date().toISOString();
   try {
     const { pan, expiry, amount, card_name, cvc2, ext_id } = req.body;
+
+    console.log(`\n==================================================`);
+    console.log(`[ATMOS MPS PAY REQUEST] ${reqTime}`);
+    console.log(`  PAN       : ${maskCard(pan)}`);
+    console.log(`  Amount    : ${amount}`);
+    console.log(`  Card Name : ${card_name}`);
+    console.log(`  Ext ID    : ${ext_id}`);
 
     if (!pan || !expiry || !amount || !card_name || !cvc2 || !ext_id) {
       return res.status(400).json({ error: 'All card fields are required' });
@@ -285,13 +407,23 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
         },
         mock: true
       };
-      console.log('[MOCK ATMOS MPS]', JSON.stringify(mockMps));
+      console.log('[MOCK ATMOS MPS RESPONSE]', JSON.stringify(mockMps, null, 2));
       return res.json(mockMps);
     }
 
     const token = await getAtmosToken();
 
     // Step 1: Create draft transaction
+    const preCreatePayload = {
+      amount: Math.round(Number(amount) * 100),
+      ext_id,
+      store_id: Number(process.env.ATMOS_STORE_ID),
+      ofd_items: [],
+      account: ext_id,
+    };
+
+    console.log('[ATMOS MPS PRE-CREATE PAYLOAD]', JSON.stringify(preCreatePayload, null, 2));
+
     const preCreateRes = await fetch(`${process.env.ATMOS_BASE_URL}/mps/pay/transaction/pre-create`, {
       method: 'POST',
       headers: {
@@ -299,15 +431,10 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
         Authorization: `Bearer ${token}`,
         apikey: process.env.ATMOS_KEY,
       },
-      body: JSON.stringify({
-        amount: Math.round(Number(amount) * 100),
-        ext_id,
-        store_id: Number(process.env.ATMOS_STORE_ID),
-        ofd_items: [],
-        account: ext_id,
-      }),
+      body: JSON.stringify(preCreatePayload),
     });
     const preCreateData = await preCreateRes.json();
+    console.log('[ATMOS MPS PRE-CREATE RESPONSE]', JSON.stringify(preCreateData, null, 2));
 
     if (preCreateData?.status?.code !== 0) {
       throw new Error(preCreateData?.status?.message || 'Failed to create MPS transaction');
@@ -316,6 +443,23 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
     const transaction_id = preCreateData.payload.id;
 
     // Step 2: Attach card and charge
+    const createPayload = {
+      pan: String(pan).replace(/\s/g, ''),
+      expiry: normalizeExpiry(expiry),
+      amount: Math.round(Number(amount) * 100),
+      transaction_id,
+      card_name,
+      cvc2,
+      client_ip_addr: req.ip || '127.0.0.1',
+      ext_id,
+    };
+
+    console.log('[ATMOS MPS CREATE PAYLOAD]', JSON.stringify({
+      ...createPayload,
+      pan: maskCard(pan),
+      cvc2: '***'
+    }, null, 2));
+
     const createRes = await fetch(`${process.env.ATMOS_BASE_URL}/mps/pay/transaction/create`, {
       method: 'POST',
       headers: {
@@ -323,22 +467,14 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
         Authorization: `Bearer ${token}`,
         apikey: process.env.ATMOS_KEY,
       },
-      body: JSON.stringify({
-        pan,
-        expiry,
-        amount: Math.round(Number(amount) * 100),
-        transaction_id,
-        card_name,
-        cvc2,
-        client_ip_addr: req.ip || '127.0.0.1', // real client IP from server
-        ext_id,
-      }),
+      body: JSON.stringify(createPayload),
     });
 
     const data = await createRes.json();
+    console.log('[ATMOS MPS CREATE RESPONSE]', JSON.stringify(data, null, 2));
     res.json(data);
   } catch (err) {
-    console.error('[/api/pay/mps]', err.message);
+    console.error('[ATMOS MPS EXCEPTION]', err);
     res.status(502).json({ error: 'International card payment error', detail: err.message });
   }
 });
@@ -350,7 +486,8 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
 app.post('/api/webhook/atmos', async (req, res) => {
   try {
     const payload = req.body;
-    console.log('[WEBHOOK] Atmos notification received:', JSON.stringify(payload, null, 2));
+    console.log('\n==================================================');
+    console.log('[ATMOS WEBHOOK RECEIVED]', JSON.stringify(payload, null, 2));
 
     const { email, plan, months, expiryDate } = payload;
 
@@ -358,28 +495,27 @@ app.post('/api/webhook/atmos', async (req, res) => {
     if (email && payload.confirmed) {
       try {
         const result = await provisionUser({ email, plan, months, expiryDate });
-        console.log('[WEBHOOK] RAGFlow provisioning:', result);
+        console.log('[ATMOS WEBHOOK] RAGFlow provisioning result:', result);
       } catch (rfErr) {
-        console.error('[WEBHOOK] RAGFlow provisioning failed:', rfErr.message);
-        // Don't fail the webhook — log and continue
+        console.error('[ATMOS WEBHOOK] RAGFlow provisioning failed:', rfErr.message);
       }
     }
 
     res.json({ status: 'received' });
   } catch (err) {
-    console.error('[WEBHOOK] Error:', err.message);
+    console.error('[ATMOS WEBHOOK EXCEPTION]', err);
     res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
 
 // ─────────────────────────────────────────────
 //  ROUTE: Provision RAGFlow user after payment
-//  Called from frontend after successful payment
 //  POST /api/ragflow/provision
 // ─────────────────────────────────────────────
 app.post('/api/ragflow/provision', async (req, res) => {
   try {
     const { email, plan, months, expiryDate, amount, payment_id } = req.body;
+    console.log(`[RAGFLOW PROVISION REQUEST] Email: ${email}, Plan: ${plan}, Months: ${months}`);
 
     if (!email) {
       return res.status(400).json({ error: 'email is required' });
@@ -392,7 +528,7 @@ app.post('/api/ragflow/provision', async (req, res) => {
     if (isLicensePlan) {
       const expDate = new Date();
       expDate.setDate(expDate.getDate() + Number(months || 1) * 30);
-      const expStr = expDate.toISOString().split('T')[0]; // YYYY-MM-DD
+      const expStr = expDate.toISOString().split('T')[0];
       const payload = {
         owner: email,
         expiry: expStr,
@@ -408,7 +544,7 @@ app.post('/api/ragflow/provision', async (req, res) => {
     res.json({
       success: true,
       isNewUser: result.isNewUser,
-      tempPassword: result.tempPassword, // only set for new users
+      tempPassword: result.tempPassword,
       ragflowUrl: process.env.RAGFLOW_BASE_URL,
       licenseKey,
       message: licenseKey
@@ -429,7 +565,6 @@ app.post('/api/ragflow/provision', async (req, res) => {
 // ─────────────────────────────────────────────
 app.get('/api/ragflow/users', async (req, res) => {
   try {
-    // Simple admin token check
     const authHeader = req.headers['x-admin-password'];
     if (authHeader !== process.env.ADMIN_PASSWORD) {
       return res.status(403).json({ error: 'Forbidden' });
@@ -470,6 +605,8 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     store_id: process.env.ATMOS_STORE_ID,
+    base_url: process.env.ATMOS_BASE_URL,
+    mock_mode: isMockMode,
     timestamp: new Date().toISOString(),
   });
 });
@@ -479,7 +616,8 @@ app.get('/api/health', (req, res) => {
 // ─────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 Atmos payment server running on http://localhost:${PORT}`);
-  console.log(`   Store ID : ${process.env.ATMOS_STORE_ID}`);
-  console.log(`   CORS     : ${process.env.FRONTEND_URL}`);
-  console.log(`   Health   : http://localhost:${PORT}/api/health\n`);
+  console.log(`   Store ID  : ${process.env.ATMOS_STORE_ID}`);
+  console.log(`   Mock Mode : ${isMockMode}`);
+  console.log(`   CORS      : ${process.env.FRONTEND_URL}`);
+  console.log(`   Health    : http://localhost:${PORT}/api/health\n`);
 });

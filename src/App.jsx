@@ -30,6 +30,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
   const [expiry, setExpiry] = useState('');
   const [otp, setOtp] = useState('');
   const [error, setError] = useState('');
+  const [hint102Error, setHint102Error] = useState(false);
   const [transactionId, setTransactionId] = useState(null);
   const [cvc, setCvc] = useState('');
   const [cardName, setCardName] = useState('');
@@ -45,7 +46,6 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
 
   const isVisaOrMastercard = !isLocalCard && (cleanCardNumber.startsWith('4') || cleanCardNumber.startsWith('5'));
 
-
   useEffect(() => {
     if (isOpen) {
       setStep('card');
@@ -53,6 +53,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
       setExpiry('');
       setOtp('');
       setError('');
+      setHint102Error(false);
       setMaskedPhone('');
     }
   }, [isOpen]);
@@ -66,12 +67,20 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
       return;
     }
     setError('');
+    setHint102Error(false);
     setStep('processing_card');
 
     try {
       // Format Expiry MM/YY → YYMM for API
       const [month, year] = expiry.split('/');
       const formattedExpiry = `${year}${month}`;
+
+      console.log('[ATMOS FRONTEND] Submitting payment request...', {
+        amount,
+        account: email,
+        isVisaOrMastercard,
+        expiryFormatted: formattedExpiry
+      });
 
       if (isVisaOrMastercard) {
         // ── Visa / Mastercard (IPS) ──────────────────────────────────
@@ -81,7 +90,6 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
           return;
         }
 
-        // Call our secure backend — CVC and card data never hit the browser logs
         const res = await fetch('/api/pay/mps', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -95,6 +103,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
           }),
         });
         const txData = await res.json();
+        console.log('[ATMOS FRONTEND MPS RESPONSE]', txData);
 
         if (!res.ok) throw new Error(txData.error || 'International card error');
 
@@ -105,18 +114,27 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
         setStep('success');
       } else {
         // ── Uzcard / Humo ────────────────────────────────────────────
-        // Step 1: Create transaction (server handles auth + store_id)
+        // Step 1: Create transaction
+        console.log('[ATMOS FRONTEND] Step 1: Creating payment transaction...');
         const createRes = await fetch('/api/pay/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ amount, account: email || 'unknown' }),
         });
         const txData = await createRes.json();
-        if (!createRes.ok) throw new Error(txData.error || txData.result?.description);
+        console.log('[ATMOS FRONTEND CREATE RESPONSE]', txData);
+
+        if (!createRes.ok) {
+          if (txData.hint === 102 || txData.detail?.hint === 102 || String(txData.error).includes('102')) {
+            setHint102Error(true);
+          }
+          throw new Error(txData.error || txData.result?.description || 'Failed to create payment transaction');
+        }
 
         setTransactionId(txData.transaction_id);
 
         // Step 2: Pre-apply (request OTP SMS)
+        console.log('[ATMOS FRONTEND] Step 2: Pre-applying (requesting SMS OTP)...', txData.transaction_id);
         const preRes = await fetch('/api/pay/pre-apply', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -127,17 +145,21 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
           }),
         });
         const preData = await preRes.json();
-        console.log('[PRE-APPLY RESPONSE]', preData);
-        if (!preRes.ok) throw new Error(preData.error || preData.result?.description);
+        console.log('[ATMOS FRONTEND PRE-APPLY RESPONSE]', preData);
 
-        // Save masked phone number returned from Atmos API if present
+        if (!preRes.ok) {
+          if (preData.hint === 102 || preData.detail?.hint === 102 || String(preData.error).includes('102')) {
+            setHint102Error(true);
+          }
+          throw new Error(preData.error || preData.result?.description || 'SMS notification failed');
+        }
+
         const phone = preData.phone || preData.phone_number || preData.phoneMask || (preData.payload && preData.payload.phone) || '';
         setMaskedPhone(phone);
-
         setStep('otp');
       }
     } catch (err) {
-      console.error(err);
+      console.error('[ATMOS FRONTEND ERROR]', err);
       setError(err.message || 'Payment gateway error. Check API configuration.');
       setStep('card');
     }
@@ -150,21 +172,29 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
       return;
     }
     setError('');
+    setHint102Error(false);
     setStep('processing_otp');
 
     try {
-      // Step 3: Apply — server validates OTP format + calls Atmos
+      console.log('[ATMOS FRONTEND] Step 3: Confirming OTP for tx:', transactionId);
       const res = await fetch('/api/pay/apply', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transaction_id: transactionId, otp }),
       });
       const confirmData = await res.json();
-      if (!res.ok) throw new Error(confirmData.error || 'Payment confirmation failed');
+      console.log('[ATMOS FRONTEND APPLY RESPONSE]', confirmData);
+
+      if (!res.ok) {
+        if (confirmData.hint === 102 || confirmData.detail?.hint === 102 || String(confirmData.error).includes('102')) {
+          setHint102Error(true);
+        }
+        throw new Error(confirmData.error || 'Payment confirmation failed');
+      }
 
       setStep('success');
     } catch (err) {
-      console.error(err);
+      console.error('[ATMOS FRONTEND OTP ERROR]', err);
       setError(err.message || 'Invalid OTP or API error.');
       setStep('otp');
     }
@@ -284,7 +314,24 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
                 </div>
               )}
 
-              {error && <p className="text-red-400 text-sm text-center">{error}</p>}
+              {hint102Error ? (
+                <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-4 my-3 text-xs text-amber-300 text-left space-y-2">
+                  <div className="flex items-center gap-2 font-bold text-amber-400">
+                    <ShieldAlert className="w-4 h-4 shrink-0" />
+                    <span>СМС-уведомление не отправлено (Код / Hint 102)</span>
+                  </div>
+                  <p>
+                    На карте Uzcard / Humo не удалось запросить СМС с кодом.
+                  </p>
+                  <ul className="list-disc pl-4 space-y-1 text-amber-200/90 text-[11px]">
+                    <li>Убедитесь, что на вашей карте <strong>включено СМС-информирование</strong> (в мобильном банке или банкомате).</li>
+                    <li>Проверьте правильно ли введён номер карты и срок действия.</li>
+                    <li>Попробуйте другую карту Uzcard, Humo, Visa или Mastercard.</li>
+                  </ul>
+                </div>
+              ) : error ? (
+                <p className="text-red-400 text-sm text-center my-2">{error}</p>
+              ) : null}
 
               <button
                 type="submit"
@@ -405,9 +452,16 @@ const PaymentPage = ({ settings, setUsers }) => {
     plan: tier.label,
   };
 
+  const [emailError, setEmailError] = useState('');
+
   const handlePay = (e) => {
     e.preventDefault();
-    if (!email) return;
+    setEmailError('');
+    const trimmed = (email || '').trim();
+    if (!trimmed || !trimmed.includes('@')) {
+      setEmailError('Пожалуйста, введите корректный Email адрес (например, name@domain.com)');
+      return;
+    }
     setIsModalOpen(true);
   };
 
@@ -612,6 +666,9 @@ const PaymentPage = ({ settings, setUsers }) => {
                 </span>
               )}
             </div>
+            {emailError && (
+              <p className="text-xs text-red-400 mt-1">{emailError}</p>
+            )}
             {urlEmail && (
               <p className="text-xs text-gray-500">Email взят из вашей учётной записи Swipes AI</p>
             )}
