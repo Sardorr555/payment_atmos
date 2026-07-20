@@ -125,10 +125,16 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
         console.log('[ATMOS FRONTEND CREATE RESPONSE]', txData);
 
         if (!createRes.ok) {
-          if (txData.hint === 102 || txData.detail?.hint === 102 || String(txData.error).includes('102')) {
-            setHint102Error(true);
-          }
-          throw new Error(txData.error || txData.result?.description || 'Failed to create payment transaction');
+          const is102 = txData.hint === 102 || 
+                        txData.detail?.hint === 102 || 
+                        txData.detail?.result?.code === 102 ||
+                        String(txData.error).includes('102') ||
+                        String(txData.error).toLowerCase().includes('sms');
+          if (is102) setHint102Error(true);
+          const msg = is102 
+            ? 'Ошибка СМС-информирования (Код 102): Не удалось запросить отправку СМС на эту карту.' 
+            : (txData.error || txData.result?.description || 'Не удалось создать платеж');
+          throw new Error(msg);
         }
 
         setTransactionId(txData.transaction_id);
@@ -148,10 +154,16 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
         console.log('[ATMOS FRONTEND PRE-APPLY RESPONSE]', preData);
 
         if (!preRes.ok) {
-          if (preData.hint === 102 || preData.detail?.hint === 102 || String(preData.error).includes('102')) {
-            setHint102Error(true);
-          }
-          throw new Error(preData.error || preData.result?.description || 'SMS notification failed');
+          const is102 = preData.hint === 102 || 
+                        preData.detail?.hint === 102 || 
+                        preData.detail?.result?.code === 102 ||
+                        String(preData.error).includes('102') ||
+                        String(preData.error).toLowerCase().includes('sms');
+          if (is102) setHint102Error(true);
+          const msg = is102 
+            ? 'Ошибка СМС-информирования (Код 102): СМС с кодом не отправлено на карту.' 
+            : (preData.error || preData.result?.description || 'Не удалось отправить СМС код');
+          throw new Error(msg);
         }
 
         const phone = preData.phone || preData.phone_number || preData.phoneMask || (preData.payload && preData.payload.phone) || '';
@@ -160,7 +172,10 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
       }
     } catch (err) {
       console.error('[ATMOS FRONTEND ERROR]', err);
-      setError(err.message || 'Payment gateway error. Check API configuration.');
+      if (String(err.message).includes('102')) {
+        setHint102Error(true);
+      }
+      setError(err.message || 'Ошибка платежного шлюза. Проверьте настройки API.');
       setStep('card');
     }
   };
