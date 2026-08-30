@@ -195,7 +195,7 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
       return res.status(400).json({ error: 'transaction_id, card_number and expiry are required' });
     }
 
-    if (isMock || String(transaction_id).startsWith('mock-tx-')) {
+    if (isMock && String(transaction_id).startsWith('mock-tx-')) {
       return res.json({
         result: { code: 'OK' },
         status: 'waiting_otp',
@@ -245,7 +245,7 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
       return res.status(400).json({ error: 'OTP must be exactly 6 digits' });
     }
 
-    if (isMock || String(transaction_id).startsWith('mock-tx-')) {
+    if (isMock && String(transaction_id).startsWith('mock-tx-')) {
       let provisionResult = null;
       if (email && plan) {
         try {
@@ -406,64 +406,71 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
   }
 });
 
-const verifyAtmosTransaction = async (transaction_id, plan, months) => {
+const verifyAtmosTransaction = async (transaction_id, plan, months, amountPayload = null) => {
   if (!transaction_id) return false;
+
+  let data;
   if (isMock && String(transaction_id).startsWith('mock-tx-')) {
-    return { status: 'PAID', mock: true };
-  }
+    data = {
+      result: { code: 'OK' },
+      status: 'PAID',
+      amount: amountPayload !== null && amountPayload !== undefined ? Number(amountPayload) : (calculateExpectedAmountUzs(plan, months) * 100),
+      mock: true,
+    };
+  } else {
+    try {
+      const token = await getAtmosToken();
+      const res = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/merchant/pay/status`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          transaction_id: Number(transaction_id) || transaction_id,
+          store_id: Number(process.env.ATMOS_STORE_ID),
+        }),
+      }, 15000);
 
-  try {
-    const token = await getAtmosToken();
-    const res = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/merchant/pay/status`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        transaction_id: Number(transaction_id) || transaction_id,
-        store_id: Number(process.env.ATMOS_STORE_ID),
-      }),
-    }, 15000);
-
-    const data = await parseJsonResponse(res, 'Atmos Status Verification');
-    console.log('[ATMOS REVERSE STATUS CHECK]', JSON.stringify(data, null, 2));
-
-    const code = data?.result?.code;
-    const status = String(data?.status || data?.result?.status || '').toUpperCase();
-    const hint = data?.hint;
-
-    // Strict success criteria:
-    // 1. Result code must be 'OK' or 1 / '1'
-    // 2. Status MUST be explicitly 'PAID', 'SUCCESS', or 'CONFIRMED' (NO fallback to transaction_id!)
-    // 3. Hint must not be error code (e.g. 102)
-    const isSuccessCode = code === 'OK' || code === 1 || code === '1';
-    const isPaidStatus = status === 'PAID' || status === 'SUCCESS' || status === 'CONFIRMED';
-    const isNotHintError = hint !== 102 && String(hint) !== '102';
-
-    if (!isSuccessCode || !isPaidStatus || !isNotHintError) {
+      data = await parseJsonResponse(res, 'Atmos Status Verification');
+      console.log('[ATMOS REVERSE STATUS CHECK]', JSON.stringify(data, null, 2));
+    } catch (err) {
+      console.error('[ATMOS REVERSE STATUS CHECK FAILED]', err.message);
       return false;
     }
+  }
 
-    // ── Amount & Plan Verification (Fail-Closed) ──
-    if (plan) {
-      const expectedUzs = calculateExpectedAmountUzs(plan, months);
-      // data.amount is returned in tiyins (1 UZS = 100 tiyins)
-      const paidTiyins = Number(data?.amount || data?.payload?.amount || 0);
-      const paidUzs = Math.round(paidTiyins / 100);
+  const code = data?.result?.code;
+  const status = String(data?.status || data?.result?.status || '').toUpperCase();
+  const hint = data?.hint;
 
-      // Fail-closed: if expected price is > 0, paid amount must be valid and sufficient
-      if (expectedUzs > 0 && (!paidUzs || paidUzs <= 0 || paidUzs < expectedUzs * 0.95)) {
-        console.error(`[PRICE MISMATCH] Invalid or insufficient paid amount: ${paidUzs} UZS, expected at least ${expectedUzs} UZS for plan "${plan}" (${months} mo)`);
-        return false;
-      }
-    }
+  // Strict success criteria:
+  // 1. Result code must be 'OK' or 1 / '1'
+  // 2. Status MUST be explicitly 'PAID', 'SUCCESS', or 'CONFIRMED' (NO fallback to transaction_id!)
+  // 3. Hint must not be error code (e.g. 102)
+  const isSuccessCode = code === 'OK' || code === 1 || code === '1';
+  const isPaidStatus = status === 'PAID' || status === 'SUCCESS' || status === 'CONFIRMED';
+  const isNotHintError = hint !== 102 && String(hint) !== '102';
 
-    return data;
-  } catch (err) {
-    console.error('[ATMOS REVERSE STATUS CHECK FAILED]', err.message);
+  if (!isSuccessCode || !isPaidStatus || !isNotHintError) {
     return false;
   }
+
+  // ── Amount & Plan Verification (Fail-Closed) ──
+  if (plan) {
+    const expectedUzs = calculateExpectedAmountUzs(plan, months);
+    // data.amount is returned in tiyins (1 UZS = 100 tiyins)
+    const paidTiyins = Number(data?.amount || data?.payload?.amount || 0);
+    const paidUzs = Math.round(paidTiyins / 100);
+
+    // Fail-closed: if expected price is > 0, paid amount must be valid and sufficient
+    if (expectedUzs > 0 && (!paidUzs || paidUzs <= 0 || paidUzs < expectedUzs * 0.95)) {
+      console.error(`[PRICE MISMATCH] Invalid or insufficient paid amount: ${paidUzs} UZS, expected at least ${expectedUzs} UZS for plan "${plan}" (${months} mo)`);
+      return false;
+    }
+  }
+
+  return data;
 };
 
 // ─────────────────────────────────────────────
@@ -485,7 +492,7 @@ app.post('/api/webhook/atmos', async (req, res) => {
     }
 
     // 2. Zero-Trust Reverse Verification with Atmos Gateway (including amount check)
-    const verifiedData = await verifyAtmosTransaction(transaction_id, plan, months);
+    const verifiedData = await verifyAtmosTransaction(transaction_id, plan, months, payload.amount);
     if (!verifiedData) {
       console.error(`[WEBHOOK REJECTED] Fake, unpaid, or underpaid transaction ID: ${transaction_id}`);
       return res.status(400).json({ error: 'Unverified transaction: payment not confirmed or amount mismatch by Atmos gateway' });

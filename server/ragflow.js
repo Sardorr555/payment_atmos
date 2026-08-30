@@ -168,6 +168,19 @@ export const registerUser = async (email, nickname) => {
 //  in the RAGFlow database without touching the user's active session.
 // ─────────────────────────────────────────────────────────────────────────────
 export const provisionUser = async ({ email, plan, months, expiryDate, license_name }) => {
+  if (process.env.NODE_ENV !== 'production' && process.env.ATMOS_MOCK === 'true' && (!BASE || BASE.includes('localhost:3096') || BASE.includes('mock') || !process.env.RAGFLOW_API_KEY)) {
+    console.log(`[RAGFlow MOCK] ✅ Mock provisioned plan="${plan}" for ${email}`);
+    return {
+      success: true,
+      email,
+      plan,
+      months,
+      expiryDate,
+      licenseKey: plan && plan.includes('license') ? `SWIPIES-ACT-MOCK-${Date.now()}` : null,
+      ragflowUrl: BASE || 'http://localhost:9380',
+    };
+  }
+
   const adminToken = await getAdminToken();
 
   // ── Step 1: Provision the plan in RAGFlow DB ──
