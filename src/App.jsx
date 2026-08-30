@@ -17,6 +17,31 @@ const generateUUID = () => {
   });
 };
 
+const safeFetchJson = async (url, options) => {
+  let res;
+  try {
+    res = await fetch(url, options);
+  } catch (err) {
+    throw new Error(`Не удалось подключиться к серверу (${err.message || 'Network Error'}). Проверьте подключение.`);
+  }
+
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    if (!res.ok) {
+      throw new Error(`Платежный шлюз временно недоступен (Код ${res.status}: ${res.statusText || 'Bad Gateway'}). Убедитесь, что сервис оплаты запущен.`);
+    }
+    throw new Error(`Некорректный ответ от сервера (${res.status}): ${text.slice(0, 120)}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(data?.error || data?.result?.description || data?.message || `Ошибка запроса (${res.status})`);
+  }
+  return data;
+};
+
 // API keys are stored on the backend server — never in the frontend!
 // All payment calls go through our secure Express proxy at /api/*
 
@@ -24,7 +49,7 @@ const generateUUID = () => {
 // ==========================================
 // 1. Atmos Modal Component
 // ==========================================
-const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
+const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email, plan, months }) => {
   const [step, setStep] = useState('card'); // card, processing_card, otp, processing_otp, success
   const [cardNumber, setCardNumber] = useState('');
   const [expiry, setExpiry] = useState('');
@@ -76,13 +101,13 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
       if (isVisaOrMastercard) {
         // ── Visa / Mastercard (IPS) ──────────────────────────────────
         if (cvc.length < 3 || cardName.trim().length === 0) {
-          setError('Please enter valid CVC and Cardholder Name for international cards');
+          setError('CVC and Cardholder Name are required for Visa/Mastercard');
           setStep('card');
           return;
         }
 
         // Call our secure backend — CVC and card data never hit the browser logs
-        const res = await fetch('/api/pay/mps', {
+        const txData = await safeFetchJson('/api/pay/mps', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -92,32 +117,31 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
             card_name: cardName,
             cvc2: cvc,
             ext_id: generateUUID(),
+            email,
+            plan,
+            months,
           }),
         });
-        const txData = await res.json();
-
-        if (!res.ok) throw new Error(txData.error || 'International card error');
 
         if (txData.payload?.redirect_uri) {
           window.location.href = txData.payload.redirect_uri;
           return;
         }
         setStep('success');
+        onSuccess && onSuccess(txData.provision);
       } else {
         // ── Uzcard / Humo ────────────────────────────────────────────
         // Step 1: Create transaction (server handles auth + store_id)
-        const createRes = await fetch('/api/pay/create', {
+        const txData = await safeFetchJson('/api/pay/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ amount, account: email || 'unknown' }),
         });
-        const txData = await createRes.json();
-        if (!createRes.ok) throw new Error(txData.error || txData.result?.description);
 
         setTransactionId(txData.transaction_id);
 
         // Step 2: Pre-apply (request OTP SMS)
-        const preRes = await fetch('/api/pay/pre-apply', {
+        const preData = await safeFetchJson('/api/pay/pre-apply', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -126,9 +150,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
             expiry: formattedExpiry,
           }),
         });
-        const preData = await preRes.json();
         console.log('[PRE-APPLY RESPONSE]', preData);
-        if (!preRes.ok) throw new Error(preData.error || preData.result?.description);
 
         // Save masked phone number returned from Atmos API if present
         const phone = preData.phone || preData.phone_number || preData.phoneMask || (preData.payload && preData.payload.phone) || '';
@@ -138,7 +160,7 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
       }
     } catch (err) {
       console.error(err);
-      setError(err.message || 'Payment gateway error. Check API configuration.');
+      setError(err.message || 'Payment gateway error. Please try again.');
       setStep('card');
     }
   };
@@ -153,16 +175,21 @@ const AtmosModal = ({ isOpen, onClose, onSuccess, amount, title, email }) => {
     setStep('processing_otp');
 
     try {
-      // Step 3: Apply — server validates OTP format + calls Atmos
-      const res = await fetch('/api/pay/apply', {
+      // Step 3: Apply — server validates OTP format + calls Atmos + auto-provisions
+      const applyData = await safeFetchJson('/api/pay/apply', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transaction_id: transactionId, otp }),
+        body: JSON.stringify({
+          transaction_id: transactionId,
+          otp,
+          email,
+          plan,
+          months,
+        }),
       });
-      const confirmData = await res.json();
-      if (!res.ok) throw new Error(confirmData.error || 'Payment confirmation failed');
 
       setStep('success');
+      onSuccess && onSuccess(applyData.provision);
     } catch (err) {
       console.error(err);
       setError(err.message || 'Invalid OTP or API error.');
@@ -411,7 +438,7 @@ const PaymentPage = ({ settings, setUsers }) => {
     setIsModalOpen(true);
   };
 
-  const handlePaymentSuccess = async () => {
+  const handlePaymentSuccess = async (provisionResult) => {
     const startDate = new Date();
     const expiryDate = new Date();
     expiryDate.setDate(startDate.getDate() + currentPlan.duration);
@@ -432,26 +459,9 @@ const PaymentPage = ({ settings, setUsers }) => {
       return newUsers;
     });
 
-    // ─ Provision user in RAGFlow ─────────────────────────────────
-    try {
-      const expiryDate = newUser.expiryDate;
-      const res = await fetch('/api/ragflow/provision', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email,
-          plan: currentPlan.plan,
-          months: selectedMonths,
-          expiryDate,
-        }),
-      });
-      const rfData = await res.json();
-      setRagflowResult(rfData);
-    } catch (rfErr) {
-      console.warn('RAGFlow provisioning error (non-critical):', rfErr.message);
-      setRagflowResult({ success: false, error: rfErr.message });
+    if (provisionResult) {
+      setRagflowResult(provisionResult);
     }
-
     setIsSuccess(true);
   };
 
@@ -639,6 +649,8 @@ const PaymentPage = ({ settings, setUsers }) => {
         amount={currentPlan.amount}
         title={currentPlan.title}
         email={email}
+        plan={currentPlan.plan}
+        months={selectedMonths}
       />
     </div>
   );
