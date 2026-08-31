@@ -225,3 +225,120 @@ export const provisionUser = async ({ email, plan, months, expiryDate, license_n
   };
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Payment Ledger integration: init, finalize, fail
+// ─────────────────────────────────────────────────────────────────────────────
+export const initPaymentTransaction = async ({ transaction_id, email, plan, months, payment_method }) => {
+  if (process.env.NODE_ENV !== 'production' && process.env.ATMOS_MOCK === 'true' && (!BASE || BASE.includes('mock') || !process.env.RAGFLOW_API_KEY)) {
+    return { success: true, mock: true };
+  }
+
+  const adminToken = await getAdminToken();
+  const authHeader = adminToken.startsWith('Bearer ') ? adminToken : `Bearer ${adminToken}`;
+
+  const res = await fetch(`${BASE}/api/v1/system/payment/init`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({
+      transaction_id,
+      email,
+      plan,
+      months,
+      payment_method: payment_method || 'atmos_uzcard_humo',
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.code !== 0) {
+    console.warn(`[RAGFlow Ledger] Payment init failed for tx=${transaction_id}:`, data.message || res.statusText);
+  }
+  return data;
+};
+
+export const finalizePaymentTransaction = async ({ transaction_id, email, plan, months, license_name }) => {
+  if (process.env.NODE_ENV !== 'production' && process.env.ATMOS_MOCK === 'true' && (!BASE || BASE.includes('mock') || !process.env.RAGFLOW_API_KEY)) {
+    console.log(`[RAGFlow MOCK] ✅ Finalized mock transaction ${transaction_id}`);
+    return {
+      success: true,
+      email,
+      plan,
+      months,
+      licenseKey: plan && plan.includes('license') ? `SWIPIES-ACT-MOCK-${Date.now()}` : null,
+      ragflowUrl: BASE || 'http://localhost:9380',
+    };
+  }
+
+  const adminToken = await getAdminToken();
+  const authHeader = adminToken.startsWith('Bearer ') ? adminToken : `Bearer ${adminToken}`;
+
+  console.log(`[RAGFlow System API] Finalizing transaction_id="${transaction_id}" plan="${plan}" months=${months} for ${email}`);
+
+  const res = await fetch(`${BASE}/api/v1/system/payment/finalize`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({
+      transaction_id,
+      email,
+      plan,
+      months,
+      license_name: license_name || undefined,
+    }),
+  });
+
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    const raw = await res.text();
+    throw new Error(`RAGFlow finalize returned non-JSON (${res.status}): ${raw.slice(0, 200)}`);
+  }
+
+  if (!res.ok || data.code !== 0) {
+    throw new Error(data.message || `Payment finalization failed (HTTP ${res.status})`);
+  }
+
+  console.log(`[RAGFlow System API] ✅ Transaction "${transaction_id}" successfully verified and provisioned for ${email}`);
+
+  return {
+    success: true,
+    email,
+    plan,
+    months,
+    paid_amount_uzs: data.data?.paid_amount_uzs,
+    licenseKey: data.data?.license_key || null,
+    ragflowUrl: BASE,
+  };
+};
+
+export const failPaymentTransaction = async ({ transaction_id, error_code, error_message, gateway_response }) => {
+  if (process.env.NODE_ENV !== 'production' && process.env.ATMOS_MOCK === 'true' && (!BASE || BASE.includes('mock') || !process.env.RAGFLOW_API_KEY)) {
+    return { success: true };
+  }
+
+  const adminToken = await getAdminToken();
+  const authHeader = adminToken.startsWith('Bearer ') ? adminToken : `Bearer ${adminToken}`;
+
+  const res = await fetch(`${BASE}/api/v1/system/payment/fail`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({
+      transaction_id,
+      error_code,
+      error_message,
+      gateway_response,
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  return data;
+};
+

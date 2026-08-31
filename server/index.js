@@ -3,7 +3,14 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import fetch from 'node-fetch';
 import 'dotenv/config';
-import { provisionUser, listUsers, findUserByEmail } from './ragflow.js';
+import {
+  provisionUser,
+  listUsers,
+  findUserByEmail,
+  initPaymentTransaction,
+  finalizePaymentTransaction,
+  failPaymentTransaction,
+} from './ragflow.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -176,6 +183,16 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
       });
     }
 
+    const plan = req.body.plan || 'plus';
+    const months = Number(req.body.months || 1);
+    initPaymentTransaction({
+      transaction_id: data.transaction_id,
+      email: account,
+      plan,
+      months,
+      payment_method: 'atmos_uzcard_humo',
+    }).catch((e) => console.warn('[Init Ledger Warning]', e.message));
+
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/create]', err.message);
@@ -289,6 +306,12 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
     const hint = data?.hint;
     const isSuccess = (code === 'OK' || code === 1 || code === '1') && hint !== 102 && String(hint) !== '102';
     if (!isSuccess) {
+      failPaymentTransaction({
+        transaction_id,
+        error_code: String(code || hint),
+        error_message: data?.result?.description || 'Payment failed',
+        gateway_response: data,
+      }).catch(() => {});
       return res.status(400).json({ error: data?.result?.description || 'Payment failed' });
     }
 
@@ -303,14 +326,21 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
       // Fail-closed verification: paid amount must be positive and cover expected price
       if (expectedUzs > 0 && (!paidUzs || paidUzs <= 0 || paidUzs < expectedUzs * 0.95)) {
         console.error(`[PAY APPLY PRICE MISMATCH] Invalid or insufficient paid amount: ${paidUzs} UZS < expected ${expectedUzs} UZS for plan "${plan}" (${months} mo)`);
+        failPaymentTransaction({
+          transaction_id,
+          error_code: 'PRICE_MISMATCH',
+          error_message: `Paid ${paidUzs} UZS < expected ${expectedUzs} UZS`,
+          gateway_response: data,
+        }).catch(() => {});
         return res.status(400).json({
           error: `Payment amount (${paidUzs} UZS) is invalid or does not match required price (${expectedUzs} UZS) for plan ${plan}.`,
         });
       }
 
       try {
-        console.log(`[PAY APPLY SUCCESS] Auto-provisioning plan=${plan} (${months}mo) for ${email} (paid: ${paidUzs || expectedUzs} UZS)`);
-        provisionResult = await provisionUser({
+        console.log(`[PAY APPLY SUCCESS] Finalizing plan=${plan} (${months}mo) for ${email} (tx=${transaction_id})`);
+        provisionResult = await finalizePaymentTransaction({
+          transaction_id,
           email,
           plan,
           months: Number(months || 1),
@@ -318,6 +348,11 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
         });
       } catch (rfErr) {
         console.error('[PAY APPLY PROVISION ERROR]', rfErr.message);
+        failPaymentTransaction({
+          transaction_id,
+          error_code: 'PROVISION_FAILED',
+          error_message: rfErr.message,
+        }).catch(() => {});
       }
     }
 
@@ -495,12 +530,19 @@ app.post('/api/webhook/atmos', async (req, res) => {
     const verifiedData = await verifyAtmosTransaction(transaction_id, plan, months, payload.amount);
     if (!verifiedData) {
       console.error(`[WEBHOOK REJECTED] Fake, unpaid, or underpaid transaction ID: ${transaction_id}`);
+      failPaymentTransaction({
+        transaction_id,
+        error_code: 'UNVERIFIED_WEBHOOK',
+        error_message: 'Unverified transaction: payment not confirmed or amount mismatch by Atmos gateway',
+        gateway_response: payload,
+      }).catch(() => {});
       return res.status(400).json({ error: 'Unverified transaction: payment not confirmed or amount mismatch by Atmos gateway' });
     }
 
-    // 3. Provision only upon confirmed verification
-    console.log(`[WEBHOOK VERIFIED] Provisioning plan="${plan}" for ${email} (tx=${transaction_id})`);
-    const result = await provisionUser({
+    // 3. Provision & ledger finalization only upon confirmed verification
+    console.log(`[WEBHOOK VERIFIED] Finalizing plan="${plan}" for ${email} (tx=${transaction_id})`);
+    const result = await finalizePaymentTransaction({
+      transaction_id,
       email,
       plan,
       months: Number(months || 1),
