@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'atmos-payment',
       script: 'index.js',
-      cwd: '/home/ubuntu/swipies__ai_/atmos payment system/server',
+      cwd: '/home/ubuntu/swipies__ai_/atmos_payment_system/server',
       instances: 1,
       autorestart: true,
       watch: false,
