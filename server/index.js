@@ -687,9 +687,11 @@ app.get('/api/ragflow/user', async (req, res) => {
 
 // ─────────────────────────────────────────────
 //  ROUTE: Health check
-//  GET /api/health
 // ─────────────────────────────────────────────
-app.get('/api/health', (req, res) => {
+//  ROUTE: Health check (both local & public proxy)
+//  GET /api/health or /api/pay/health
+// ─────────────────────────────────────────────
+app.get(['/api/health', '/api/pay/health'], (req, res) => {
   res.json({
     status: 'ok',
     store_id: process.env.ATMOS_STORE_ID,
