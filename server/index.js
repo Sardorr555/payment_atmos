@@ -15,6 +15,17 @@ import {
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ─────────────────────────────────────────────
+//  Process-level Crash Safety (Never Exit on Unhandled Errors)
+// ─────────────────────────────────────────────
+process.on('uncaughtException', (err, origin) => {
+  console.error(`[CRITICAL UNCAUGHT EXCEPTION] origin=${origin}:`, err?.stack || err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[CRITICAL UNHANDLED REJECTION] reason:', reason);
+});
+
 // Trust reverse proxy (Nginx) for rate limiter IP detection
 app.set('trust proxy', 1);
 
@@ -104,33 +115,61 @@ export const calculateExpectedAmountUzs = (plan, months = 1) => {
 };
 
 // ─────────────────────────────────────────────
-//  Atmos Auth helper — runs on the SERVER only
+//  Atmos Auth helper with Token Caching & Auto-Retry
 // ─────────────────────────────────────────────
-const getAtmosToken = async () => {
+let cachedToken = null;
+let tokenExpiryTime = 0;
+
+const getAtmosToken = async (forceRefresh = false) => {
   if (isMock) {
     return 'mock-token';
+  }
+
+  const now = Date.now();
+  if (!forceRefresh && cachedToken && now < tokenExpiryTime) {
+    return cachedToken;
   }
 
   const auth = Buffer.from(
     `${process.env.ATMOS_KEY}:${process.env.ATMOS_SECRET}`
   ).toString('base64');
 
-  const res = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/token`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: 'grant_type=client_credentials',
-  }, 12000);
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/token`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${auth}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: 'grant_type=client_credentials',
+      }, 12000);
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Atmos auth failed (${res.status}): ${text.slice(0, 150)}`);
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Atmos auth failed (${res.status}): ${text.slice(0, 150)}`);
+      }
+
+      const data = await parseJsonResponse(res, 'Atmos Token');
+      if (!data.access_token) {
+        throw new Error(`Atmos auth returned no access_token: ${JSON.stringify(data)}`);
+      }
+
+      cachedToken = data.access_token;
+      const expiresInSec = Number(data.expires_in) || 3600;
+      tokenExpiryTime = now + (expiresInSec - 300) * 1000;
+      return cachedToken;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[Atmos Token Attempt ${attempt}/2 failed]:`, err.message);
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
   }
 
-  const data = await parseJsonResponse(res, 'Atmos Token');
-  return data.access_token;
+  throw lastErr;
 };
 
 // ─────────────────────────────────────────────
@@ -196,7 +235,7 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/create]', err.message);
-    res.status(502).json({ error: err.message || 'Payment gateway error', detail: err.message });
+    res.status(503).json({ error: err.message || 'Payment gateway error', code: 'GATEWAY_ERROR', detail: err.message });
   }
 });
 
@@ -242,7 +281,7 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/pre-apply]', err.message);
-    res.status(502).json({ error: err.message || 'Payment gateway error', detail: err.message });
+    res.status(503).json({ error: err.message || 'Payment gateway error', code: 'GATEWAY_ERROR', detail: err.message });
   }
 });
 
@@ -363,7 +402,7 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
     });
   } catch (err) {
     console.error('[/api/pay/apply]', err.message);
-    res.status(502).json({ error: err.message || 'Payment gateway error', detail: err.message });
+    res.status(503).json({ error: err.message || 'Payment gateway error', code: 'GATEWAY_ERROR', detail: err.message });
   }
 });
 
@@ -437,7 +476,7 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/mps]', err.message);
-    res.status(502).json({ error: err.message || 'International card payment error', detail: err.message });
+    res.status(503).json({ error: err.message || 'International card payment error', code: 'GATEWAY_ERROR', detail: err.message });
   }
 });
 
@@ -656,6 +695,9 @@ app.get('/api/health', (req, res) => {
     store_id: process.env.ATMOS_STORE_ID,
     mock: isMock,
     timestamp: new Date().toISOString(),
+    uptime: Math.round(process.uptime()),
+    memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB',
+    pid: process.pid,
   });
 });
 

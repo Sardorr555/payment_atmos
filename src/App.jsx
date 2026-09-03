@@ -31,13 +31,19 @@ const safeFetchJson = async (url, options) => {
     data = text ? JSON.parse(text) : {};
   } catch {
     if (!res.ok) {
-      throw new Error(`Платежный шлюз временно недоступен (Код ${res.status}: ${res.statusText || 'Bad Gateway'}). Убедитесь, что сервис оплаты запущен.`);
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        throw new Error(`Платежный шлюз временно перезапускается (Код ${res.status}). Сервис автоматически восстанавливается, повторите попытку через несколько секунд.`);
+      }
+      throw new Error(`Некорректный ответ от сервера (${res.status}): ${text.slice(0, 120)}`);
     }
-    throw new Error(`Некорректный ответ от сервера (${res.status}): ${text.slice(0, 120)}`);
   }
 
   if (!res.ok) {
-    throw new Error(data?.error || data?.result?.description || data?.message || `Ошибка запроса (${res.status})`);
+    const errorMsg = data?.error || data?.detail || data?.result?.description || data?.message;
+    if (errorMsg) {
+      throw new Error(errorMsg);
+    }
+    throw new Error(`Ошибка запроса (${res.status})`);
   }
   return data;
 };
