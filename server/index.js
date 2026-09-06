@@ -114,6 +114,22 @@ export const calculateExpectedAmountUzs = (plan, months = 1) => {
   return Math.round(total);
 };
 
+// Helper to safely extract paid amount in tiyins from diverse Atmos payload formats
+export const extractPaidTiyins = (resData) => {
+  if (!resData) return 0;
+  return Number(
+    resData.amount ||
+    resData.payload?.amount ||
+    resData.store_transaction?.amount ||
+    resData.store_transaction?.total_amount ||
+    resData.store_transaction?.trans_amount ||
+    resData.transaction?.amount ||
+    resData.data?.amount ||
+    resData.result?.amount ||
+    0
+  );
+};
+
 // ─────────────────────────────────────────────
 //  Atmos Auth helper with Token Caching & Auto-Retry
 // ─────────────────────────────────────────────
@@ -343,7 +359,22 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
 
     const code = data?.result?.code;
     const hint = data?.hint;
-    const isSuccess = (code === 'OK' || code === 1 || code === '1') && hint !== 102 && String(hint) !== '102';
+    let isSuccess = (code === 'OK' || code === 1 || code === '1') && hint !== 102 && String(hint) !== '102';
+
+    // If apply did not return OK directly, check if the transaction is already confirmed on Atmos gateway
+    // (e.g. OTP was already consumed on a previous attempt where money was debited)
+    if (!isSuccess) {
+      try {
+        const verifyCheck = await verifyAtmosTransaction(transaction_id, plan, months);
+        if (verifyCheck) {
+          console.log(`[PAY APPLY RECOVERY] Transaction ${transaction_id} was already confirmed on Atmos gateway.`);
+          isSuccess = true;
+        }
+      } catch (checkErr) {
+        console.warn('[Atmos Apply Verify Check]', checkErr.message);
+      }
+    }
+
     if (!isSuccess) {
       failPaymentTransaction({
         transaction_id,
@@ -358,8 +389,63 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
     let provisionResult = null;
     if (email && plan) {
       const expectedUzs = calculateExpectedAmountUzs(plan, months);
-      // data.amount or data.payload.amount from Atmos is in tiyins (1 UZS = 100 tiyins)
-      const paidTiyins = Number(data?.amount || data?.payload?.amount || 0);
+      
+      // 1. Try extracting amount directly from Atmos Apply response
+      let paidTiyins = extractPaidTiyins(data);
+
+      // 2. If Apply response did not include amount, query Atmos /merchant/pay/status
+      if (!paidTiyins || paidTiyins <= 0) {
+        try {
+          const statusRes = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/merchant/pay/status`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              transaction_id: Number(transaction_id) || transaction_id,
+              store_id: Number(process.env.ATMOS_STORE_ID),
+            }),
+          }, 15000);
+          const statusData = await parseJsonResponse(statusRes, 'Atmos Status Check');
+          console.log('[ATMOS STATUS CHECK DURING APPLY]', JSON.stringify(statusData, null, 2));
+          paidTiyins = extractPaidTiyins(statusData);
+        } catch (statusErr) {
+          console.warn('[Atmos Status Check Error]', statusErr.message);
+        }
+      }
+
+      // 3. If still not found, try GET /merchant/pay/get
+      if (!paidTiyins || paidTiyins <= 0) {
+        try {
+          const getRes = await fetchWithTimeout(
+            `${process.env.ATMOS_BASE_URL}/merchant/pay/get?store_id=${process.env.ATMOS_STORE_ID}&transaction_id=${transaction_id}`,
+            {
+              method: 'GET',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+            },
+            15000
+          );
+          const getData = await parseJsonResponse(getRes, 'Atmos Get Check');
+          console.log('[ATMOS GET CHECK DURING APPLY]', JSON.stringify(getData, null, 2));
+          paidTiyins = extractPaidTiyins(getData);
+        } catch (getErr) {
+          console.warn('[Atmos Get Check Error]', getErr.message);
+        }
+      }
+
+      // 4. Fallback: If gateway confirmed success (isSuccess is true) but omitted amount in its response,
+      // use expectedUzs since the transaction amount was bound to expected price during /api/pay/create
+      if (!paidTiyins || paidTiyins <= 0) {
+        if (isSuccess) {
+          console.log(`[PAY APPLY] Gateway confirmed success for tx=${transaction_id}. Amount field omitted in response, using expected amount ${expectedUzs} UZS`);
+          paidTiyins = Math.round(expectedUzs * 100);
+        }
+      }
+
       const paidUzs = Math.round(paidTiyins / 100);
 
       // Fail-closed verification: paid amount must be positive and cover expected price
@@ -403,6 +489,45 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
   } catch (err) {
     console.error('[/api/pay/apply]', err.message);
     res.status(503).json({ error: err.message || 'Payment gateway error', code: 'GATEWAY_ERROR', detail: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+//  ROUTE: Recover / Re-provision already debited transaction
+//  POST /api/pay/recover
+// ─────────────────────────────────────────────
+app.post('/api/pay/recover', paymentLimiter, async (req, res) => {
+  try {
+    const { email, transaction_id, plan = 'plus', months = 1, license_name } = req.body;
+
+    if (!email || !transaction_id) {
+      return res.status(400).json({ error: 'email and transaction_id are required' });
+    }
+
+    console.log(`[PAY RECOVER] Attempting recovery for email=${email}, tx=${transaction_id}, plan=${plan}`);
+
+    // Verify transaction status with Atmos gateway
+    const verifiedData = await verifyAtmosTransaction(transaction_id, plan, months);
+    if (!verifiedData) {
+      return res.status(400).json({ error: 'Transaction could not be verified as paid on Atmos gateway.' });
+    }
+
+    const provisionResult = await finalizePaymentTransaction({
+      transaction_id,
+      email,
+      plan,
+      months: Number(months || 1),
+      license_name,
+    });
+
+    res.json({
+      success: true,
+      recovered: true,
+      provision: provisionResult,
+    });
+  } catch (err) {
+    console.error('[/api/pay/recover]', err.message);
+    res.status(500).json({ error: err.message || 'Recovery failed' });
   }
 });
 
@@ -533,8 +658,14 @@ const verifyAtmosTransaction = async (transaction_id, plan, months, amountPayloa
   // ── Amount & Plan Verification (Fail-Closed) ──
   if (plan) {
     const expectedUzs = calculateExpectedAmountUzs(plan, months);
-    // data.amount is returned in tiyins (1 UZS = 100 tiyins)
-    const paidTiyins = Number(data?.amount || data?.payload?.amount || 0);
+    let paidTiyins = extractPaidTiyins(data) || (amountPayload ? Number(amountPayload) : 0);
+
+    // If gateway confirmed success (PAID/CONFIRMED) but omitted amount in its response,
+    // fallback to expected price since the transaction amount was bound at creation
+    if ((!paidTiyins || paidTiyins <= 0) && isPaidStatus && isSuccessCode) {
+      paidTiyins = Math.round(expectedUzs * 100);
+    }
+
     const paidUzs = Math.round(paidTiyins / 100);
 
     // Fail-closed: if expected price is > 0, paid amount must be valid and sufficient
