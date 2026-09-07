@@ -97,7 +97,12 @@ export const getDynamicPricing = async () => {
     return cachedPricing;
   }
   const base = process.env.RAGFLOW_BASE_URL || 'http://127.0.0.1:9380';
-  const urls = [`${base}/api/v1/system/version`, `${base}/v1/system/version`];
+  const urls = [
+    `${base}/api/v1/system/config`,
+    `${base}/v1/system/config`,
+    `${base}/api/v1/system/version`,
+    `${base}/v1/system/version`
+  ];
   for (const u of urls) {
     try {
       const res = await fetchWithTimeout(u, {}, 5000);
