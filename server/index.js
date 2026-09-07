@@ -877,6 +877,57 @@ app.get('/api/ragflow/user', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+//  ADMIN ROUTES: Protected by x-admin-password
+// ─────────────────────────────────────────────
+app.get('/api/pay/admin/logs', async (req, res) => {
+  try {
+    const authHeader = req.headers['x-admin-password'];
+    if (!process.env.ADMIN_PASSWORD || authHeader !== process.env.ADMIN_PASSWORD) {
+      return res.status(403).json({ error: 'Forbidden. Admin authentication required.' });
+    }
+    const fs = await import('fs');
+    const logPath = './atmos.log';
+    if (fs.existsSync(logPath)) {
+      const data = fs.readFileSync(logPath, 'utf8');
+      const lines = data.split('\n').slice(-200).join('\n');
+      return res.type('text/plain').send(lines);
+    }
+    res.send('No log file found');
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/pay/admin/provision', async (req, res) => {
+  try {
+    const authHeader = req.headers['x-admin-password'];
+    if (!process.env.ADMIN_PASSWORD || authHeader !== process.env.ADMIN_PASSWORD) {
+      return res.status(403).json({ error: 'Forbidden. Admin authentication required.' });
+    }
+    const { email, plan = 'plus', months = 1 } = req.body;
+    if (!email) return res.status(400).json({ error: 'email is required' });
+
+    const result = await provisionUser({ email, plan, months });
+    res.json({ success: true, provision: result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/pay/admin/users', async (req, res) => {
+  try {
+    const authHeader = req.headers['x-admin-password'];
+    if (!process.env.ADMIN_PASSWORD || authHeader !== process.env.ADMIN_PASSWORD) {
+      return res.status(403).json({ error: 'Forbidden. Admin authentication required.' });
+    }
+    const users = await listUsers();
+    res.json({ success: true, users });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 //  ROUTE: Live pricing from Admin Panel
 //  GET /api/pay/pricing or /api/pricing
 // ─────────────────────────────────────────────
