@@ -533,14 +533,26 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
           plan,
           months: Number(months || 1),
           license_name,
+          gateway_response: data,
         });
       } catch (rfErr) {
-        console.error('[PAY APPLY PROVISION ERROR]', rfErr.message);
-        failPaymentTransaction({
-          transaction_id,
-          error_code: 'PROVISION_FAILED',
-          error_message: rfErr.message,
-        }).catch(() => {});
+        console.warn(`[PAY APPLY FALLBACK] finalizePaymentTransaction threw: ${rfErr.message}. Attempting direct provisionUser fallback...`);
+        try {
+          provisionResult = await provisionUser({
+            email,
+            plan,
+            months: Number(months || 1),
+            license_name,
+          });
+          console.log(`[PAY APPLY FALLBACK SUCCESS] ✅ User ${email} provisioned to plan=${plan} via fallback!`);
+        } catch (fallbackErr) {
+          console.error('[PAY APPLY PROVISION ERROR]', fallbackErr.message);
+          failPaymentTransaction({
+            transaction_id,
+            error_code: 'PROVISION_FAILED',
+            error_message: `${rfErr.message} | ${fallbackErr.message}`,
+          }).catch(() => {});
+        }
       }
     }
 
@@ -581,6 +593,7 @@ app.post('/api/pay/recover', paymentLimiter, async (req, res) => {
       plan,
       months: Number(months || 1),
       license_name,
+      gateway_response: verifiedData,
     });
 
     res.json({
@@ -777,6 +790,7 @@ app.post('/api/webhook/atmos', async (req, res) => {
       plan,
       months: Number(months || 1),
       license_name,
+      gateway_response: verifiedData || payload,
     });
 
     res.json({ status: 'success', verified: true, provision: result });

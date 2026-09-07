@@ -282,7 +282,7 @@ export const initPaymentTransaction = async ({ transaction_id, email, plan, mont
   return data;
 };
 
-export const finalizePaymentTransaction = async ({ transaction_id, email, plan, months, license_name }) => {
+export const finalizePaymentTransaction = async ({ transaction_id, email, plan, months, license_name, gateway_response }) => {
   if (process.env.NODE_ENV !== 'production' && process.env.ATMOS_MOCK === 'true' && (!BASE || BASE.includes('mock') || !process.env.RAGFLOW_API_KEY)) {
     console.log(`[RAGFlow MOCK] ✅ Finalized mock transaction ${transaction_id}`);
     return {
@@ -300,44 +300,59 @@ export const finalizePaymentTransaction = async ({ transaction_id, email, plan, 
 
   console.log(`[RAGFlow System API] Finalizing transaction_id="${transaction_id}" plan="${plan}" months=${months} for ${email}`);
 
-  const res = await fetchRagflow('/api/v1/system/payment/finalize', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: authHeader,
-    },
-    body: JSON.stringify({
-      transaction_id,
-      email,
-      plan,
-      months,
-      license_name: license_name || undefined,
-    }),
-  });
-
-  let data;
   try {
-    data = await res.json();
-  } catch {
-    const raw = await res.text();
-    throw new Error(`RAGFlow finalize returned non-JSON (${res.status}): ${raw.slice(0, 200)}`);
+    const res = await fetchRagflow('/api/v1/system/payment/finalize', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: authHeader,
+      },
+      body: JSON.stringify({
+        transaction_id,
+        email,
+        plan,
+        months,
+        license_name: license_name || undefined,
+        gateway_response: gateway_response || undefined,
+      }),
+    });
+
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      const raw = await res.text();
+      throw new Error(`RAGFlow finalize returned non-JSON (${res.status}): ${raw.slice(0, 200)}`);
+    }
+
+    if (res.ok && data.code === 0) {
+      console.log(`[RAGFlow System API] ✅ Transaction "${transaction_id}" successfully verified and provisioned for ${email}`);
+      return {
+        success: true,
+        email,
+        plan,
+        months,
+        paid_amount_uzs: data.data?.paid_amount_uzs,
+        licenseKey: data.data?.license_key || null,
+        ragflowUrl: BASE,
+      };
+    } else {
+      console.warn(`[RAGFlow System API] Ledger finalize returned error (${data?.message || res.statusText}). Falling back to direct provisionUser...`);
+    }
+  } catch (err) {
+    console.warn(`[RAGFlow System API] Ledger finalize call failed (${err.message}). Falling back to direct provisionUser...`);
   }
 
-  if (!res.ok || data.code !== 0) {
-    throw new Error(data.message || `Payment finalization failed (HTTP ${res.status})`);
-  }
-
-  console.log(`[RAGFlow System API] ✅ Transaction "${transaction_id}" successfully verified and provisioned for ${email}`);
-
-  return {
-    success: true,
+  // Guaranteed fallback: call /api/v1/system/provision directly so user is always provisioned
+  console.log(`[RAGFlow System API] Calling provisionUser fallback for ${email} (plan=${plan}, months=${months})`);
+  const fallbackResult = await provisionUser({
     email,
     plan,
-    months,
-    paid_amount_uzs: data.data?.paid_amount_uzs,
-    licenseKey: data.data?.license_key || null,
-    ragflowUrl: BASE,
-  };
+    months: Number(months || 1),
+    license_name,
+  });
+  console.log(`[RAGFlow System API] ✅ User ${email} provisioned successfully via provisionUser fallback`);
+  return fallbackResult;
 };
 
 export const failPaymentTransaction = async ({ transaction_id, error_code, error_message, gateway_response }) => {
