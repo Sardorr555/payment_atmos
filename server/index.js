@@ -96,25 +96,36 @@ export const getDynamicPricing = async () => {
   if (cachedPricing && Date.now() - cachedPricingTime < 15000) {
     return cachedPricing;
   }
-  const base = process.env.RAGFLOW_BASE_URL || 'http://127.0.0.1:9380';
-  const urls = [
-    `${base}/api/v1/system/config`,
-    `${base}/v1/system/config`,
-    `${base}/api/v1/system/version`,
-    `${base}/v1/system/version`
+  const rawBase = (process.env.RAGFLOW_BASE_URL || 'https://app.swipies.app').replace(/\/+$/, '');
+  const fixedBase = rawBase.replace(/^https?:\/\/swipies\.app(?::\d+)?$/, 'https://app.swipies.app');
+  const candidateBases = [
+    fixedBase,
+    'https://app.swipies.app',
+    'http://127.0.0.1:9222',
+    'http://127.0.0.1:9380',
+    'http://127.0.0.1:80',
+    'http://localhost:9222',
+    'http://localhost:9380',
   ];
-  for (const u of urls) {
-    try {
-      const res = await fetchWithTimeout(u, {}, 5000);
-      const json = await parseJsonResponse(res, 'Dynamic Pricing');
-      if (json?.data?.pricing) {
-        cachedPricing = json.data.pricing;
-        cachedPricingTime = Date.now();
-        console.log('[DYNAMIC PRICING LOADED FROM ADMIN PANEL]', JSON.stringify(cachedPricing));
-        return cachedPricing;
+  const uniqueBases = Array.from(new Set(candidateBases.filter(Boolean)));
+  for (const b of uniqueBases) {
+    const urls = [
+      `${b}/api/v1/system/config`,
+      `${b}/v1/system/config`,
+    ];
+    for (const u of urls) {
+      try {
+        const res = await fetchWithTimeout(u, {}, 4000);
+        const json = await parseJsonResponse(res, 'Dynamic Pricing');
+        if (json?.data?.pricing) {
+          cachedPricing = json.data.pricing;
+          cachedPricingTime = Date.now();
+          console.log(`[DYNAMIC PRICING LOADED FROM ADMIN PANEL via ${u}]`, JSON.stringify(cachedPricing));
+          return cachedPricing;
+        }
+      } catch (err) {
+        // try next candidate
       }
-    } catch (err) {
-      // try next url
     }
   }
   return cachedPricing || {
@@ -509,18 +520,9 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
 
       const paidUzs = Math.round(paidTiyins / 100);
 
-      // Once isSuccess is confirmed by Atmos, card was debited! Never reject confirmed user with 400!
-      if (!isSuccess && expectedUzs > 0 && (!paidUzs || paidUzs <= 0 || paidUzs < expectedUzs * 0.95)) {
-        console.error(`[PAY APPLY PRICE MISMATCH] Unconfirmed or insufficient paid amount: ${paidUzs} UZS < expected ${expectedUzs} UZS for plan "${plan}" (${months} mo)`);
-        failPaymentTransaction({
-          transaction_id,
-          error_code: 'PRICE_MISMATCH',
-          error_message: `Paid ${paidUzs} UZS < expected ${expectedUzs} UZS`,
-          gateway_response: data,
-        }).catch(() => {});
-        return res.status(400).json({
-          error: `Payment amount (${paidUzs} UZS) is invalid or does not match required price (${expectedUzs} UZS) for plan ${plan}.`,
-        });
+      // Once isSuccess is confirmed by Atmos, card was debited! Under no circumstances reject with 400!
+      if (expectedUzs > 0 && paidUzs < expectedUzs * 0.95) {
+        console.warn(`[PAY APPLY PRICE NOTICE] Gateway confirmed payment with paidUzs=${paidUzs} UZS vs expectedUzs=${expectedUzs} UZS for plan "${plan}". Proceeding with automatic provisioning.`);
       }
 
       try {

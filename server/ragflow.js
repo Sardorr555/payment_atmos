@@ -12,7 +12,8 @@ import crypto from 'crypto';
 import fs from 'fs';
 import fetch from 'node-fetch';
 
-const BASE = process.env.RAGFLOW_BASE_URL; // e.g. https://app.swipies.app
+const rawBase = process.env.RAGFLOW_BASE_URL || 'https://app.swipies.app';
+const BASE = rawBase.replace(/\/+$/, '').replace(/^https?:\/\/swipies\.app(?::\d+)?$/, 'https://app.swipies.app');
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  RSA Password encryption (RAGFlow requires this for login)
