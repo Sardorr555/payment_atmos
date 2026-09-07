@@ -12,8 +12,39 @@ import crypto from 'crypto';
 import fs from 'fs';
 import fetch from 'node-fetch';
 
-const rawBase = process.env.RAGFLOW_BASE_URL || 'https://app.swipies.app';
-const BASE = rawBase.replace(/\/+$/, '').replace(/^https?:\/\/swipies\.app(?::\d+)?$/, 'https://app.swipies.app');
+const candidateBases = [
+  process.env.RAGFLOW_INTERNAL_URL,
+  'http://127.0.0.1:9222',
+  'http://127.0.0.1:9380',
+  'http://localhost:9222',
+  'http://localhost:9380',
+  process.env.RAGFLOW_BASE_URL,
+  'https://app.swipies.app',
+].filter(Boolean);
+
+export const fetchRagflow = async (path, options = {}) => {
+  let lastErr = null;
+  for (const b of candidateBases) {
+    const cleanBase = b.replace(/\/+$/, '').replace(/^https?:\/\/swipies\.app(?::\d+)?$/, 'https://app.swipies.app');
+    const url = `${cleanBase}${path.startsWith('/') ? path : '/' + path}`;
+    try {
+      const res = await fetch(url, options);
+      if (res.status === 403 || res.status === 503) {
+        const text = await res.clone().text().catch(() => '');
+        if (text.includes('Just a moment...') || text.includes('cf-chl')) {
+          console.warn(`[RAGFlow Fetch] ${url} hit Cloudflare challenge, skipping to next internal base...`);
+          continue;
+        }
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error(`Failed to reach RAGFlow at ${path}`);
+};
+
+const BASE = 'http://127.0.0.1:9222';
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  RSA Password encryption (RAGFlow requires this for login)
@@ -75,7 +106,7 @@ const getAdminToken = async () => {
   const encPsw = encryptPassword(password);
 
   // Correct RAGFlow v0.26.x login endpoint: /v1/auth/login
-  const res = await fetch(`${BASE}/v1/auth/login`, {
+  const res = await fetchRagflow('/v1/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password: encPsw }),
@@ -106,7 +137,7 @@ const getAdminToken = async () => {
 export const listUsers = async () => {
   const token = await getAdminToken();
 
-  const res = await fetch(`${BASE}/api/v1/admin/users`, {
+  const res = await fetchRagflow('/api/v1/admin/users', {
     headers: { Authorization: token },
   });
 
@@ -145,7 +176,7 @@ export const registerUser = async (email, nickname) => {
   const plainPassword = generatePassword();
   const encPsw = encryptPassword(plainPassword);
 
-  const res = await fetch(`${BASE}/api/v1/users`, {
+  const res = await fetchRagflow('/api/v1/users', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -187,7 +218,7 @@ export const provisionUser = async ({ email, plan, months, expiryDate, license_n
   // ── Step 1: Provision the plan in RAGFlow DB ──
   console.log(`[RAGFlow] Provisioning plan="${plan}" months=${months} for ${email}`);
 
-  const provRes = await fetch(`${BASE}/api/v1/system/provision`, {
+  const provRes = await fetchRagflow('/api/v1/system/provision', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -237,7 +268,7 @@ export const initPaymentTransaction = async ({ transaction_id, email, plan, mont
   const adminToken = await getAdminToken();
   const authHeader = adminToken.startsWith('Bearer ') ? adminToken : `Bearer ${adminToken}`;
 
-  const res = await fetch(`${BASE}/api/v1/system/payment/init`, {
+  const res = await fetchRagflow('/api/v1/system/payment/init', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -277,7 +308,7 @@ export const finalizePaymentTransaction = async ({ transaction_id, email, plan, 
 
   console.log(`[RAGFlow System API] Finalizing transaction_id="${transaction_id}" plan="${plan}" months=${months} for ${email}`);
 
-  const res = await fetch(`${BASE}/api/v1/system/payment/finalize`, {
+  const res = await fetchRagflow('/api/v1/system/payment/finalize', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -325,7 +356,7 @@ export const failPaymentTransaction = async ({ transaction_id, error_code, error
   const adminToken = await getAdminToken();
   const authHeader = adminToken.startsWith('Bearer ') ? adminToken : `Bearer ${adminToken}`;
 
-  const res = await fetch(`${BASE}/api/v1/system/payment/fail`, {
+  const res = await fetchRagflow('/api/v1/system/payment/fail', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
