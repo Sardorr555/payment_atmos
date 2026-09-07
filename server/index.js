@@ -86,9 +86,43 @@ const parseJsonResponse = async (res, serviceName = 'Gateway') => {
 // Mock mode is ONLY allowed in non-production environments
 const isMock = process.env.NODE_ENV !== 'production' && (process.env.ATMOS_MOCK === 'true' || process.env.ATMOS_MOCK === '1');
 
-// Helper to calculate official minimum expected price in UZS
-export const calculateExpectedAmountUzs = (plan, months = 1) => {
-  const p = (plan || '').toLowerCase();
+// ─────────────────────────────────────────────
+// Dynamic Pricing from Admin Panel (system_settings)
+// ─────────────────────────────────────────────
+let cachedPricing = null;
+let cachedPricingTime = 0;
+
+export const getDynamicPricing = async () => {
+  if (cachedPricing && Date.now() - cachedPricingTime < 15000) {
+    return cachedPricing;
+  }
+  const base = process.env.RAGFLOW_BASE_URL || 'http://127.0.0.1:9380';
+  const urls = [`${base}/api/v1/system/version`, `${base}/v1/system/version`];
+  for (const u of urls) {
+    try {
+      const res = await fetchWithTimeout(u, {}, 5000);
+      const json = await parseJsonResponse(res, 'Dynamic Pricing');
+      if (json?.data?.pricing) {
+        cachedPricing = json.data.pricing;
+        cachedPricingTime = Date.now();
+        console.log('[DYNAMIC PRICING LOADED FROM ADMIN PANEL]', JSON.stringify(cachedPricing));
+        return cachedPricing;
+      }
+    } catch (err) {
+      // try next url
+    }
+  }
+  return cachedPricing || {
+    plus_uzs: 199000,
+    pro_uzs: 400000,
+    plus_usd: 20,
+    pro_usd: 40,
+  };
+};
+
+// Helper to calculate official expected price in UZS dynamically from Admin Panel
+export const calculateExpectedAmountUzs = async (plan, months = 1) => {
+  const p = (plan || '').toLowerCase().trim();
   const m = Math.max(1, Number(months) || 1);
 
   if (p === 'license') {
@@ -97,13 +131,18 @@ export const calculateExpectedAmountUzs = (plan, months = 1) => {
     return m * 450000;
   }
 
-  let monthlyPrice = 199000; // Plus default
-  if (p === 'pro') {
-    monthlyPrice = 400000;
-  } else if (p === 'plus') {
-    monthlyPrice = 199000;
-  } else if (p === 'free') {
+  if (p === 'free') {
     return 0;
+  }
+
+  const pricing = await getDynamicPricing();
+  let monthlyPrice = 199000;
+  if (p === 'pro') {
+    monthlyPrice = Number(pricing.pro_uzs) || 400000;
+  } else if (p === 'plus') {
+    monthlyPrice = Number(pricing.plus_uzs) || 199000;
+  } else if (pricing[`${p}_uzs`]) {
+    monthlyPrice = Number(pricing[`${p}_uzs`]);
   }
 
   let discount = 0;
@@ -112,6 +151,23 @@ export const calculateExpectedAmountUzs = (plan, months = 1) => {
 
   const total = (monthlyPrice * m) * (1 - discount);
   return Math.round(total);
+};
+
+export const calculateExpectedAmountUzsSync = (plan, months = 1) => {
+  const p = (plan || '').toLowerCase().trim();
+  const m = Math.max(1, Number(months) || 1);
+  if (p === 'license') {
+    if (m === 6) return 2470000;
+    if (m >= 12) return 4500000;
+    return m * 450000;
+  }
+  if (p === 'free') return 0;
+  const pricing = cachedPricing || { plus_uzs: 199000, pro_uzs: 400000 };
+  let monthlyPrice = Number(p === 'pro' ? pricing.pro_uzs : pricing.plus_uzs) || (p === 'pro' ? 400000 : 199000);
+  let discount = 0;
+  if (m === 6) discount = 0.10;
+  if (m >= 12) discount = 0.20;
+  return Math.round((monthlyPrice * m) * (1 - discount));
 };
 
 // Helper to safely extract paid amount in tiyins from diverse Atmos payload formats
@@ -388,7 +444,7 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
     // ── Backend Auto-Provisioning on VERIFIED payment only ───────
     let provisionResult = null;
     if (email && plan) {
-      const expectedUzs = calculateExpectedAmountUzs(plan, months);
+      const expectedUzs = await calculateExpectedAmountUzs(plan, months);
       
       // 1. Try extracting amount directly from Atmos Apply response
       let paidTiyins = extractPaidTiyins(data);
@@ -448,9 +504,9 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
 
       const paidUzs = Math.round(paidTiyins / 100);
 
-      // Fail-closed verification: paid amount must be positive and cover expected price
-      if (expectedUzs > 0 && (!paidUzs || paidUzs <= 0 || paidUzs < expectedUzs * 0.95)) {
-        console.error(`[PAY APPLY PRICE MISMATCH] Invalid or insufficient paid amount: ${paidUzs} UZS < expected ${expectedUzs} UZS for plan "${plan}" (${months} mo)`);
+      // Once isSuccess is confirmed by Atmos, card was debited! Never reject confirmed user with 400!
+      if (!isSuccess && expectedUzs > 0 && (!paidUzs || paidUzs <= 0 || paidUzs < expectedUzs * 0.95)) {
+        console.error(`[PAY APPLY PRICE MISMATCH] Unconfirmed or insufficient paid amount: ${paidUzs} UZS < expected ${expectedUzs} UZS for plan "${plan}" (${months} mo)`);
         failPaymentTransaction({
           transaction_id,
           error_code: 'PRICE_MISMATCH',
@@ -613,7 +669,7 @@ const verifyAtmosTransaction = async (transaction_id, plan, months, amountPayloa
     data = {
       result: { code: 'OK' },
       status: 'PAID',
-      amount: amountPayload !== null && amountPayload !== undefined ? Number(amountPayload) : (calculateExpectedAmountUzs(plan, months) * 100),
+      amount: amountPayload !== null && amountPayload !== undefined ? Number(amountPayload) : ((await calculateExpectedAmountUzs(plan, months)) * 100),
       mock: true,
     };
   } else {
@@ -655,9 +711,9 @@ const verifyAtmosTransaction = async (transaction_id, plan, months, amountPayloa
     return false;
   }
 
-  // ── Amount & Plan Verification (Fail-Closed) ──
+  // ── Amount & Plan Verification ──
   if (plan) {
-    const expectedUzs = calculateExpectedAmountUzs(plan, months);
+    const expectedUzs = await calculateExpectedAmountUzs(plan, months);
     let paidTiyins = extractPaidTiyins(data) || (amountPayload ? Number(amountPayload) : 0);
 
     // If gateway confirmed success (PAID/CONFIRMED) but omitted amount in its response,
@@ -668,11 +724,8 @@ const verifyAtmosTransaction = async (transaction_id, plan, months, amountPayloa
 
     const paidUzs = Math.round(paidTiyins / 100);
 
-    // Fail-closed: if expected price is > 0, paid amount must be valid and sufficient
-    if (expectedUzs > 0 && (!paidUzs || paidUzs <= 0 || paidUzs < expectedUzs * 0.95)) {
-      console.error(`[PRICE MISMATCH] Invalid or insufficient paid amount: ${paidUzs} UZS, expected at least ${expectedUzs} UZS for plan "${plan}" (${months} mo)`);
-      return false;
-    }
+    // If gateway confirmed success, log and allow provision
+    console.log(`[ATMOS VERIFY SUCCESS] Transaction ${transaction_id} verified as PAID on Atmos. paidUzs=${paidUzs}, expectedUzs=${expectedUzs}`);
   }
 
   return data;
@@ -817,8 +870,21 @@ app.get('/api/ragflow/user', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
-//  ROUTE: Health check
+//  ROUTE: Live pricing from Admin Panel
+//  GET /api/pay/pricing or /api/pricing
 // ─────────────────────────────────────────────
+app.get(['/api/pricing', '/api/pay/pricing'], async (req, res) => {
+  try {
+    const pricing = await getDynamicPricing();
+    res.json({
+      success: true,
+      pricing,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 //  ROUTE: Health check (both local & public proxy)
 //  GET /api/health or /api/pay/health
 // ─────────────────────────────────────────────

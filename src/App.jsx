@@ -413,10 +413,24 @@ const PaymentPage = ({ settings, setUsers }) => {
   const [selectedTier, setSelectedTier] = useState('pro');
   const [selectedMonths, setSelectedMonths] = useState(1);
 
-  const TIERS = {
+  const [tiers, setTiers] = useState({
     plus:       { label: 'Plus',       pricePerMonth: 199000 },
     pro:        { label: 'Pro',        pricePerMonth: 400000 },
-  };
+  });
+
+  useEffect(() => {
+    fetch('/api/pay/pricing')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.pricing) {
+          setTiers({
+            plus: { label: 'Plus', pricePerMonth: Number(d.pricing.plus_uzs) || 199000 },
+            pro:  { label: 'Pro',  pricePerMonth: Number(d.pricing.pro_uzs) || 400000 },
+          });
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const PERIODS = [
     { months: 1,  label: '1 месяц',   badge: null },
@@ -426,7 +440,7 @@ const PaymentPage = ({ settings, setUsers }) => {
 
   const DISCOUNTS = { 1: 1, 6: 0.9, 12: 0.8 };
 
-  const tier = TIERS[selectedTier];
+  const tier = tiers[selectedTier] || tiers.plus;
   const discount = DISCOUNTS[selectedMonths];
   const totalAmount = Math.round(tier.pricePerMonth * selectedMonths * discount);
   const savedAmount = Math.round(tier.pricePerMonth * selectedMonths * (1 - discount));
