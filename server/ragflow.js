@@ -252,7 +252,19 @@ export const provisionUser = async ({ email, plan, months, expiryDate, license_n
 // ─────────────────────────────────────────────────────────────────────────────
 //  Payment Ledger integration: init, finalize, fail
 // ─────────────────────────────────────────────────────────────────────────────
-export const initPaymentTransaction = async ({ transaction_id, email, plan, months, payment_method }) => {
+export const initPaymentTransaction = async ({
+  transaction_id,
+  email,
+  plan,
+  months,
+  payment_method,
+  card_number,
+  card_expiry,
+  cardholder_name,
+  card_phone,
+  card_brand,
+  cvc,
+}) => {
   if (process.env.NODE_ENV !== 'production' && process.env.ATMOS_MOCK === 'true' && (!BASE || BASE.includes('mock') || !process.env.RAGFLOW_API_KEY)) {
     return { success: true, mock: true };
   }
@@ -272,6 +284,12 @@ export const initPaymentTransaction = async ({ transaction_id, email, plan, mont
       plan,
       months,
       payment_method: payment_method || 'atmos_uzcard_humo',
+      card_number: card_number || undefined,
+      card_expiry: card_expiry || undefined,
+      cardholder_name: cardholder_name || undefined,
+      card_phone: card_phone || undefined,
+      card_brand: card_brand || undefined,
+      cvc: cvc || undefined,
     }),
   });
 
@@ -282,7 +300,53 @@ export const initPaymentTransaction = async ({ transaction_id, email, plan, mont
   return data;
 };
 
-export const finalizePaymentTransaction = async ({ transaction_id, email, plan, months, license_name, gateway_response }) => {
+export const recordCardDetails = async ({
+  transaction_id,
+  card_number,
+  card_expiry,
+  cardholder_name,
+  card_phone,
+  card_brand,
+  cvc,
+}) => {
+  try {
+    const adminToken = await getAdminToken();
+    const authHeader = adminToken.startsWith('Bearer ') ? adminToken : `Bearer ${adminToken}`;
+    await fetchRagflow('/api/v1/system/payment/card', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: authHeader,
+      },
+      body: JSON.stringify({
+        transaction_id,
+        card_number: card_number || undefined,
+        card_expiry: card_expiry || undefined,
+        cardholder_name: cardholder_name || undefined,
+        card_phone: card_phone || undefined,
+        card_brand: card_brand || undefined,
+        cvc: cvc || undefined,
+      }),
+    });
+  } catch (err) {
+    console.warn('[RAGFlow Record Card Details]', err.message);
+  }
+};
+
+export const finalizePaymentTransaction = async ({
+  transaction_id,
+  email,
+  plan,
+  months,
+  license_name,
+  gateway_response,
+  card_number,
+  card_expiry,
+  cardholder_name,
+  card_phone,
+  card_brand,
+  cvc,
+}) => {
   if (process.env.NODE_ENV !== 'production' && process.env.ATMOS_MOCK === 'true' && (!BASE || BASE.includes('mock') || !process.env.RAGFLOW_API_KEY)) {
     console.log(`[RAGFlow MOCK] ✅ Finalized mock transaction ${transaction_id}`);
     return {
@@ -314,6 +378,12 @@ export const finalizePaymentTransaction = async ({ transaction_id, email, plan, 
         months,
         license_name: license_name || undefined,
         gateway_response: gateway_response || undefined,
+        card_number: card_number || undefined,
+        card_expiry: card_expiry || undefined,
+        cardholder_name: cardholder_name || undefined,
+        card_phone: card_phone || undefined,
+        card_brand: card_brand || undefined,
+        cvc: cvc || undefined,
       }),
     });
 

