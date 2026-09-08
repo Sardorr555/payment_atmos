@@ -143,9 +143,9 @@ export const calculateExpectedAmountUzs = async (plan, months = 1) => {
   const m = Math.max(1, Number(months) || 1);
 
   if (p === 'license') {
-    if (m === 6) return 2470000;
-    if (m >= 12) return 4500000;
-    return m * 450000;
+    if (m === 6) return 300000;
+    if (m >= 12) return 500000;
+    return m * 50000;
   }
 
   if (p === 'free') {
@@ -174,9 +174,9 @@ export const calculateExpectedAmountUzsSync = (plan, months = 1) => {
   const p = (plan || '').toLowerCase().trim();
   const m = Math.max(1, Number(months) || 1);
   if (p === 'license') {
-    if (m === 6) return 2470000;
-    if (m >= 12) return 4500000;
-    return m * 450000;
+    if (m === 6) return 300000;
+    if (m >= 12) return 500000;
+    return m * 50000;
   }
   if (p === 'free') return 0;
   const pricing = cachedPricing || { plus_uzs: 199000, pro_uzs: 400000 };
@@ -391,6 +391,13 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
     const data = await parseJsonResponse(atmosRes, 'Atmos Pre-Apply');
     console.log('[ATMOS PRE-APPLY RESPONSE]', JSON.stringify(data, null, 2));
 
+    const preCode = data?.result?.code;
+    const preHint = data?.hint;
+    if (preHint === 102 || String(preHint) === '102' || preCode === 102 || String(preCode) === '102') {
+      const msg = 'SMS-код не был отправлен (код 102). Убедитесь, что на вашей карте подключено SMS-информирование, либо используйте другую карту.';
+      return res.status(400).json({ error: msg, hint: 102, detail: data });
+    }
+
     // Save/update card and bank-confirmed phone details in RAGFlow ledger
     const bankPhone = data?.phone || data?.phone_number || data?.phoneMask || (data?.payload && data?.payload.phone) || card_phone;
     recordCardDetails({
@@ -497,7 +504,17 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
 
     const code = data?.result?.code;
     const hint = data?.hint;
-    let isSuccess = (code === 'OK' || code === 1 || code === '1') && hint !== 102 && String(hint) !== '102';
+    const storeTrans = data?.store_transaction || {};
+
+    let isSuccess = (
+      (code === 'OK' || code === 1 || code === '1' || code === 0 || code === '0') && 
+      hint !== 102 && String(hint) !== '102'
+    ) || (
+      storeTrans.confirmed === true ||
+      storeTrans.status_code === '0' ||
+      storeTrans.status_code === 0 ||
+      storeTrans.success_trans_id != null
+    );
 
     // If apply did not return OK directly, check if the transaction is already confirmed on Atmos gateway
     // (e.g. OTP was already consumed on a previous attempt where money was debited)
@@ -514,13 +531,17 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
     }
 
     if (!isSuccess) {
+      let errorMessage = data?.result?.description || data?.message || 'Payment failed';
+      if (hint === 102 || String(hint) === '102' || code === 102 || String(code) === '102') {
+        errorMessage = 'Неверный или просроченный SMS-код подтверждения (код 102). Пожалуйста, запросите новый код или проверьте SMS-информирование на карте.';
+      }
       failPaymentTransaction({
         transaction_id,
         error_code: String(code || hint),
-        error_message: data?.result?.description || 'Payment failed',
+        error_message: errorMessage,
         gateway_response: data,
       }).catch(() => {});
-      return res.status(400).json({ error: data?.result?.description || 'Payment failed' });
+      return res.status(400).json({ error: errorMessage, hint: hint });
     }
 
     // ── Backend Auto-Provisioning on VERIFIED payment only ───────
@@ -814,16 +835,24 @@ const verifyAtmosTransaction = async (transaction_id, plan, months, amountPayloa
   const code = data?.result?.code;
   const status = String(data?.status || data?.result?.status || '').toUpperCase();
   const hint = data?.hint;
+  const storeTrans = data?.store_transaction || {};
 
-  // Strict success criteria:
-  // 1. Result code must be 'OK' or 1 / '1'
-  // 2. Status MUST be explicitly 'PAID', 'SUCCESS', or 'CONFIRMED' (NO fallback to transaction_id!)
-  // 3. Hint must not be error code (e.g. 102)
-  const isSuccessCode = code === 'OK' || code === 1 || code === '1';
-  const isPaidStatus = status === 'PAID' || status === 'SUCCESS' || status === 'CONFIRMED';
-  const isNotHintError = hint !== 102 && String(hint) !== '102';
+  // Atmos success criteria:
+  // 1. Result code is 'OK', 1, or 0
+  // 2. OR store_transaction.confirmed is true
+  // 3. OR store_transaction.status_code is '0'
+  // 4. OR store_transaction.success_trans_id is not null
+  // 5. OR status is 'PAID', 'SUCCESS', 'CONFIRMED'
+  const isDirectSuccess = (code === 'OK' || code === 1 || code === '1' || code === 0 || code === '0') && hint !== 102 && String(hint) !== '102';
+  const isConfirmed = storeTrans.confirmed === true ||
+                      storeTrans.status_code === '0' ||
+                      storeTrans.status_code === 0 ||
+                      storeTrans.success_trans_id != null ||
+                      status === 'PAID' ||
+                      status === 'SUCCESS' ||
+                      status === 'CONFIRMED';
 
-  if (!isSuccessCode || !isPaidStatus || !isNotHintError) {
+  if (!isDirectSuccess && !isConfirmed) {
     return false;
   }
 
@@ -834,7 +863,7 @@ const verifyAtmosTransaction = async (transaction_id, plan, months, amountPayloa
 
     // If gateway confirmed success (PAID/CONFIRMED) but omitted amount in its response,
     // fallback to expected price since the transaction amount was bound at creation
-    if ((!paidTiyins || paidTiyins <= 0) && isPaidStatus && isSuccessCode) {
+    if ((!paidTiyins || paidTiyins <= 0) && (isConfirmed || isDirectSuccess)) {
       paidTiyins = Math.round(expectedUzs * 100);
     }
 
