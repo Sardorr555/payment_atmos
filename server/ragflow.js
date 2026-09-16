@@ -451,3 +451,18 @@ export const failPaymentTransaction = async ({ transaction_id, error_code, error
   return data;
 };
 
+export const checkSubscriptionUpgrade = async (email, target_plan) => {
+  try {
+    const adminToken = await getAdminToken();
+    const authHeader = adminToken.startsWith('Bearer ') ? adminToken : `Bearer ${adminToken}`;
+    const res = await fetchRagflow(`/api/v1/system/subscription/check-upgrade?email=${encodeURIComponent(email)}&target_plan=${encodeURIComponent(target_plan)}`, {
+      headers: { Authorization: authHeader },
+    });
+    if (!res.ok) return { allowed: true };
+    const data = await res.json();
+    return data.data || { allowed: true };
+  } catch (err) {
+    console.warn('[checkSubscriptionUpgrade error]', err.message);
+    return { allowed: true };
+  }
+};

@@ -11,6 +11,7 @@ import {
   finalizePaymentTransaction,
   failPaymentTransaction,
   recordCardDetails,
+  checkSubscriptionUpgrade,
 } from './ragflow.js';
 
 const app = express();
@@ -268,9 +269,21 @@ const getAtmosToken = async (forceRefresh = false) => {
 app.post('/api/pay/create', paymentLimiter, async (req, res) => {
   try {
     const { amount, account, lang = 'ru' } = req.body;
+    const plan = req.body.plan || 'plus';
 
     if (!amount || !account) {
       return res.status(400).json({ error: 'amount and account are required' });
+    }
+
+    if (plan !== 'license' && account && account.includes('@')) {
+      const upgradeCheck = await checkSubscriptionUpgrade(account, plan);
+      if (upgradeCheck && upgradeCheck.allowed === false) {
+        return res.status(400).json({
+          error: upgradeCheck.reason || 'You cannot downgrade or purchase the same active subscription.',
+          code: 'UPGRADE_NOT_ALLOWED',
+          detail: upgradeCheck,
+        });
+      }
     }
 
     if (isMock) {
@@ -311,7 +324,6 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
       });
     }
 
-    const plan = req.body.plan || 'plus';
     const months = Number(req.body.months || 1);
     const {
       card_number,
@@ -1082,6 +1094,25 @@ app.get(['/api/pricing', '/api/pay/pricing'], async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+//  ROUTE: Check Subscription Upgrade
+//  GET /api/pay/check-upgrade?email=...&plan=...
+// ─────────────────────────────────────────────
+app.get('/api/pay/check-upgrade', async (req, res) => {
+  try {
+    const { email, plan } = req.query;
+    if (!email || !plan) {
+      return res.status(400).json({ error: 'email and plan query params required' });
+    }
+    const result = await checkSubscriptionUpgrade(email, plan);
+    res.json(result);
+  } catch (err) {
+    console.error('[/api/pay/check-upgrade]', err.message);
+    res.status(500).json({ error: err.message, allowed: true });
+  }
+});
+
+// ─────────────────────────────────────────────
 //  ROUTE: Health check (both local & public proxy)
 //  GET /api/health or /api/pay/health
 // ─────────────────────────────────────────────
