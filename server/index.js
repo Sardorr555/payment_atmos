@@ -56,7 +56,7 @@ const paymentLimiter = rateLimit({
 });
 
 // Helper for fetch with timeout (prevents hanging indefinitely)
-const fetchWithTimeout = async (url, options = {}, timeoutMs = 15000) => {
+const fetchWithTimeout = async (url, options = {}, timeoutMs = 30000) => {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -225,7 +225,7 @@ const getAtmosToken = async (forceRefresh = false) => {
   ).toString('base64');
 
   let lastErr = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const res = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/token`, {
         method: 'POST',
@@ -234,7 +234,7 @@ const getAtmosToken = async (forceRefresh = false) => {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
         body: 'grant_type=client_credentials',
-      }, 12000);
+      }, 15000);
 
       if (!res.ok) {
         const text = await res.text().catch(() => '');
@@ -252,13 +252,113 @@ const getAtmosToken = async (forceRefresh = false) => {
       return cachedToken;
     } catch (err) {
       lastErr = err;
-      console.warn(`[Atmos Token Attempt ${attempt}/2 failed]:`, err.message);
-      if (attempt < 2) {
-        await new Promise((r) => setTimeout(r, 1000));
+      console.warn(`[Atmos Token Attempt ${attempt}/3 failed]:`, err.message);
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
       }
     }
   }
 
+  throw lastErr;
+};
+
+// ─────────────────────────────────────────────
+//  Centralized, Resilient Atmos API Client
+//  (Handles Bearer token, auto-retry on 401, timeout, 5xx backoff)
+// ─────────────────────────────────────────────
+export const callAtmosApi = async ({
+  endpoint,
+  method = 'POST',
+  body = null,
+  extraHeaders = {},
+  timeoutMs = 30000,
+  maxRetries = 2,
+  logName = 'Atmos',
+}) => {
+  let lastErr = null;
+  let forceRefreshToken = false;
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    const startTime = Date.now();
+    try {
+      const token = await getAtmosToken(forceRefreshToken);
+      forceRefreshToken = false;
+
+      const headers = {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        ...extraHeaders,
+      };
+
+      const fetchOptions = {
+        method,
+        headers,
+      };
+      if (body !== null && body !== undefined) {
+        fetchOptions.body = typeof body === 'string' ? body : JSON.stringify(body);
+      }
+
+      const url = `${process.env.ATMOS_BASE_URL}${endpoint.startsWith('/') ? endpoint : '/' + endpoint}`;
+      const res = await fetchWithTimeout(url, fetchOptions, timeoutMs);
+
+      // 1. Handle 401 Unauthorized (token expired or invalidated by bank)
+      if (res.status === 401) {
+        console.warn(`[${logName}] Token 401 Unauthorized on attempt ${attempt}. Refreshing token and retrying...`);
+        cachedToken = null;
+        tokenExpiryTime = 0;
+        forceRefreshToken = true;
+        if (attempt <= maxRetries) {
+          await new Promise((r) => setTimeout(r, 600));
+          continue;
+        }
+      }
+
+      // 2. Handle 5xx Server Errors from Atmos gateway (temporary bank load / maintenance)
+      if (res.status >= 500) {
+        const errText = await res.text().catch(() => '');
+        console.warn(`[${logName}] Atmos 5xx (${res.status}) on attempt ${attempt}: ${errText.slice(0, 150)}`);
+        if (attempt <= maxRetries) {
+          await new Promise((r) => setTimeout(r, 1200 * attempt));
+          continue;
+        }
+        throw new Error(`Платежный шлюз временно недоступен (Код ${res.status}). Пожалуйста, повторите попытку.`);
+      }
+
+      const data = await parseJsonResponse(res, logName);
+      const durationMs = Date.now() - startTime;
+      console.log(`[${logName}] Success (${durationMs}ms) [attempt ${attempt}/${maxRetries + 1}]`);
+      return data;
+    } catch (err) {
+      lastErr = err;
+      const durationMs = Date.now() - startTime;
+      console.warn(`[${logName}] Attempt ${attempt}/${maxRetries + 1} failed (${durationMs}ms): ${err.message}`);
+
+      if (attempt > maxRetries) {
+        break;
+      }
+
+      // Check if error is retryable (timeout, network reset, or forced token refresh)
+      const isTimeoutOrNetwork = 
+        err.message?.includes('timed out') ||
+        err.name === 'AbortError' ||
+        err.code === 'ECONNRESET' ||
+        err.code === 'ETIMEDOUT' ||
+        err.code === 'ENOTFOUND' ||
+        err.code === 'EAI_AGAIN' ||
+        err.message?.includes('fetch failed');
+
+      if (isTimeoutOrNetwork || forceRefreshToken) {
+        const delay = 1200 * attempt;
+        await new Promise((r) => setTimeout(r, delay));
+      } else {
+        break;
+      }
+    }
+  }
+
+  if (lastErr?.message?.includes('timed out') || lastErr?.name === 'AbortError') {
+    throw new Error('Платежный шлюз временно отвечает дольше обычного (таймаут банка). Пожалуйста, повторите попытку.');
+  }
   throw lastErr;
 };
 
@@ -295,8 +395,6 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
       });
     }
 
-    const token = await getAtmosToken();
-
     const requestBody = {
       amount: Math.round(Number(amount) * 100), // тийины
       account,
@@ -305,16 +403,14 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     };
     console.log('[ATMOS PAY CREATE REQUEST]', JSON.stringify(requestBody, null, 2));
 
-    const atmosRes = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/merchant/pay/create`, {
+    const data = await callAtmosApi({
+      endpoint: '/merchant/pay/create',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(requestBody),
-    }, 15000);
-
-    const data = await parseJsonResponse(atmosRes, 'Atmos Pay Create');
+      body: requestBody,
+      timeoutMs: 30000,
+      maxRetries: 2,
+      logName: 'Atmos Pay Create',
+    });
     console.log('[ATMOS PAY CREATE RESPONSE]', JSON.stringify(data, null, 2));
 
     if (!data.transaction_id) {
@@ -351,7 +447,12 @@ app.post('/api/pay/create', paymentLimiter, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/create]', err.message);
-    res.status(503).json({ error: err.message || 'Payment gateway error', code: 'GATEWAY_ERROR', detail: err.message });
+    const isTimeout = err.message?.includes('таймаут') || err.message?.includes('timed out');
+    res.status(isTimeout ? 504 : 502).json({
+      error: err.message || 'Ошибка связи с платежным шлюзом. Пожалуйста, повторите попытку.',
+      code: isTimeout ? 'GATEWAY_TIMEOUT' : 'GATEWAY_ERROR',
+      detail: err.message,
+    });
   }
 });
 
@@ -384,23 +485,19 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
       });
     }
 
-    const token = await getAtmosToken();
-
-    const atmosRes = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/merchant/pay/pre-apply`, {
+    const data = await callAtmosApi({
+      endpoint: '/merchant/pay/pre-apply',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
+      body: {
         transaction_id: Number(transaction_id) || transaction_id,
         card_number,
         expiry,
         store_id: Number(process.env.ATMOS_STORE_ID),
-      }),
-    }, 15000);
-
-    const data = await parseJsonResponse(atmosRes, 'Atmos Pre-Apply');
+      },
+      timeoutMs: 30000,
+      maxRetries: 2,
+      logName: 'Atmos Pre-Apply',
+    });
     console.log('[ATMOS PRE-APPLY RESPONSE]', JSON.stringify(data, null, 2));
 
     const preCode = data?.result?.code;
@@ -425,7 +522,12 @@ app.post('/api/pay/pre-apply', paymentLimiter, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/pre-apply]', err.message);
-    res.status(503).json({ error: err.message || 'Payment gateway error', code: 'GATEWAY_ERROR', detail: err.message });
+    const isTimeout = err.message?.includes('таймаут') || err.message?.includes('timed out');
+    res.status(isTimeout ? 504 : 502).json({
+      error: err.message || 'Ошибка связи с платежным шлюзом. Пожалуйста, повторите попытку.',
+      code: isTimeout ? 'GATEWAY_TIMEOUT' : 'GATEWAY_ERROR',
+      detail: err.message,
+    });
   }
 });
 
@@ -496,22 +598,18 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
       });
     }
 
-    const token = await getAtmosToken();
-
-    const atmosRes = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/merchant/pay/apply`, {
+    const data = await callAtmosApi({
+      endpoint: '/merchant/pay/apply',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
+      body: {
         transaction_id: Number(transaction_id) || transaction_id,
         otp,
         store_id: Number(process.env.ATMOS_STORE_ID),
-      }),
-    }, 15000);
-
-    const data = await parseJsonResponse(atmosRes, 'Atmos Apply');
+      },
+      timeoutMs: 35000,
+      maxRetries: 2,
+      logName: 'Atmos Apply',
+    });
     console.log('[ATMOS APPLY RESPONSE]', JSON.stringify(data, null, 2));
 
     const code = data?.result?.code;
@@ -567,18 +665,17 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
       // 2. If Apply response did not include amount, query Atmos /merchant/pay/status
       if (!paidTiyins || paidTiyins <= 0) {
         try {
-          const statusRes = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/merchant/pay/status`, {
+          const statusData = await callAtmosApi({
+            endpoint: '/merchant/pay/status',
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
-            },
-            body: JSON.stringify({
+            body: {
               transaction_id: Number(transaction_id) || transaction_id,
               store_id: Number(process.env.ATMOS_STORE_ID),
-            }),
-          }, 15000);
-          const statusData = await parseJsonResponse(statusRes, 'Atmos Status Check');
+            },
+            timeoutMs: 20000,
+            maxRetries: 1,
+            logName: 'Atmos Status Check',
+          });
           console.log('[ATMOS STATUS CHECK DURING APPLY]', JSON.stringify(statusData, null, 2));
           paidTiyins = extractPaidTiyins(statusData);
         } catch (statusErr) {
@@ -586,29 +683,7 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
         }
       }
 
-      // 3. If still not found, try GET /merchant/pay/get
-      if (!paidTiyins || paidTiyins <= 0) {
-        try {
-          const getRes = await fetchWithTimeout(
-            `${process.env.ATMOS_BASE_URL}/merchant/pay/get?store_id=${process.env.ATMOS_STORE_ID}&transaction_id=${transaction_id}`,
-            {
-              method: 'GET',
-              headers: {
-                Authorization: `Bearer ${token}`,
-                'Content-Type': 'application/json',
-              },
-            },
-            15000
-          );
-          const getData = await parseJsonResponse(getRes, 'Atmos Get Check');
-          console.log('[ATMOS GET CHECK DURING APPLY]', JSON.stringify(getData, null, 2));
-          paidTiyins = extractPaidTiyins(getData);
-        } catch (getErr) {
-          console.warn('[Atmos Get Check Error]', getErr.message);
-        }
-      }
-
-      // 4. Fallback: If gateway confirmed success (isSuccess is true) but omitted amount in its response,
+      // 3. Fallback: If gateway confirmed success (isSuccess is true) but omitted amount in its response,
       // use expectedUzs since the transaction amount was bound to expected price during /api/pay/create
       if (!paidTiyins || paidTiyins <= 0) {
         if (isSuccess) {
@@ -668,7 +743,12 @@ app.post('/api/pay/apply', paymentLimiter, async (req, res) => {
     });
   } catch (err) {
     console.error('[/api/pay/apply]', err.message);
-    res.status(503).json({ error: err.message || 'Payment gateway error', code: 'GATEWAY_ERROR', detail: err.message });
+    const isTimeout = err.message?.includes('таймаут') || err.message?.includes('timed out');
+    res.status(isTimeout ? 504 : 502).json({
+      error: err.message || 'Ошибка связи с платежным шлюзом. Пожалуйста, повторите попытку.',
+      code: isTimeout ? 'GATEWAY_TIMEOUT' : 'GATEWAY_ERROR',
+      detail: err.message,
+    });
   }
 });
 
@@ -732,25 +812,22 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
       });
     }
 
-    const token = await getAtmosToken();
-
     // Step 1: Create draft transaction
-    const preCreateRes = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/mps/pay/transaction/pre-create`, {
+    const preCreateData = await callAtmosApi({
+      endpoint: '/mps/pay/transaction/pre-create',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-        apikey: process.env.ATMOS_KEY,
-      },
-      body: JSON.stringify({
+      body: {
         amount: Math.round(Number(amount) * 100),
         ext_id,
         store_id: Number(process.env.ATMOS_STORE_ID),
         ofd_items: [],
         account: ext_id,
-      }),
-    }, 15000);
-    const preCreateData = await parseJsonResponse(preCreateRes, 'Atmos MPS Pre-Create');
+      },
+      extraHeaders: { apikey: process.env.ATMOS_KEY },
+      timeoutMs: 30000,
+      maxRetries: 2,
+      logName: 'Atmos MPS Pre-Create',
+    });
 
     if (preCreateData?.status?.code !== 0) {
       throw new Error(preCreateData?.status?.message || 'Failed to create MPS transaction');
@@ -773,14 +850,10 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
     }).catch((e) => console.warn('[Init MPS Ledger Warning]', e.message));
 
     // Step 2: Attach card and charge
-    const createRes = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/mps/pay/transaction/create`, {
+    const data = await callAtmosApi({
+      endpoint: '/mps/pay/transaction/create',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-        apikey: process.env.ATMOS_KEY,
-      },
-      body: JSON.stringify({
+      body: {
         pan,
         expiry,
         amount: Math.round(Number(amount) * 100),
@@ -789,10 +862,12 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
         cvc2,
         client_ip_addr: req.ip || '127.0.0.1',
         ext_id,
-      }),
-    }, 15000);
-
-    const data = await parseJsonResponse(createRes, 'Atmos MPS Create');
+      },
+      extraHeaders: { apikey: process.env.ATMOS_KEY },
+      timeoutMs: 35000,
+      maxRetries: 2,
+      logName: 'Atmos MPS Create',
+    });
 
     recordCardDetails({
       transaction_id,
@@ -806,7 +881,12 @@ app.post('/api/pay/mps', paymentLimiter, async (req, res) => {
     res.json(data);
   } catch (err) {
     console.error('[/api/pay/mps]', err.message);
-    res.status(503).json({ error: err.message || 'International card payment error', code: 'GATEWAY_ERROR', detail: err.message });
+    const isTimeout = err.message?.includes('таймаут') || err.message?.includes('timed out');
+    res.status(isTimeout ? 504 : 502).json({
+      error: err.message || 'Ошибка обработки международной карты. Пожалуйста, повторите попытку.',
+      code: isTimeout ? 'GATEWAY_TIMEOUT' : 'GATEWAY_ERROR',
+      detail: err.message,
+    });
   }
 });
 
@@ -823,20 +903,17 @@ const verifyAtmosTransaction = async (transaction_id, plan, months, amountPayloa
     };
   } else {
     try {
-      const token = await getAtmosToken();
-      const res = await fetchWithTimeout(`${process.env.ATMOS_BASE_URL}/merchant/pay/status`, {
+      data = await callAtmosApi({
+        endpoint: '/merchant/pay/status',
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
+        body: {
           transaction_id: Number(transaction_id) || transaction_id,
           store_id: Number(process.env.ATMOS_STORE_ID),
-        }),
-      }, 15000);
-
-      data = await parseJsonResponse(res, 'Atmos Status Verification');
+        },
+        timeoutMs: 25000,
+        maxRetries: 2,
+        logName: 'Atmos Status Verification',
+      });
       console.log('[ATMOS REVERSE STATUS CHECK]', JSON.stringify(data, null, 2));
     } catch (err) {
       console.error('[ATMOS REVERSE STATUS CHECK FAILED]', err.message);
